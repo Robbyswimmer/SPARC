@@ -1,0 +1,102 @@
+##Project Context
+
+project_name: SPARC (Streaming Pruning And Retention Controller)
+description: |
+SPARC is an RL‑based framework for budget‑aware streaming context management
+in frozen LLMs. The agent interleaves KEEP, COMPRESS, and DROP decisions
+on incoming 256‑token chunks to optimize QA accuracy and token efficiency.
+tech_stack:
+
+python 3.11
+
+gymnasium >=0.29
+
+datasets (HF streaming)
+
+transformers 4.40.0
+
+llama-cpp-python (4-bit GGUF)
+
+stable-baselines3
+
+wandb
+
+numpy, scipy
+
+pytest, flake8
+
+## Directory Structure
+
+src/
+envs/
+streaming_qagym.py    # core Gym environment
+agents/
+ppo_agent.py          # PPO setup and training loop
+utils/
+reward.py             # reward calculation, shaping functions
+llm_interface.py      # wrapper for frozen LLM inference
+data/
+datasets/             # caching streams from HF
+scripts/
+train.py              # entry point for training
+evaluate.py           # run evaluation and metrics
+example_demo.py       # quickstart random-agent script
+tests/
+test_envs.py
+test_reward.py
+test_agents.py
+
+## Coding Conventions
+
+Follow PEP8: max 88 chars, snake_case for functions and variables.
+
+Use type hints everywhere; mypy should pass without errors.
+
+Each module must include a module docstring and docstrings on all classes/functions.
+
+Unit tests required for all public methods; aim for >80% coverage.
+
+Use fixtures in pytest to mock HF streaming and llama-cpp calls.
+
+##AI Agent Guidance
+
+Always reference the StreamingQAGym API: reset(), step(action) → (obs, reward, done, info).
+
+Keep reward logic in utils/reward.py; reward.py defines compute_reward(qa_score, tokens_used, keep_count, compress_count).
+
+When extending action space to COMPRESS, update both the env and the PPO agent’s action_dim.
+
+Hyperparameters live in train.py under a CONFIG dict; include α, β_keep, β_comp, γ_step, GAE λ.
+
+Log metrics (episode reward, QA_score, tokens_used) to wandb under project="SPARC".
+
+Scripts must respect the conda environment: include a comment header with # requires: conda activate streamqa.
+
+Branching & Workflow
+
+main: production-ready code, passing all tests and lint.
+
+dev: integration branch for new features; CI runs tests and lint.
+
+feature/<short-description>: for individual tickets (e.g., feature/ppo-integration).
+
+##Dependencies & Setup
+
+Maintain environment.yml in repo root for reproducible conda env.
+
+pip install -r requirements.txt should succeed in a fresh Python 3.11 environment.
+
+Commit Messages
+
+Use Conventional Commits: feat, fix, docs, style, refactor, test, chore.
+
+Include context: e.g., feat(env): add COMPRESS action to StreamingQAGym.
+
+Reminders for AI Assistants
+
+Always ask before generating new files that affect core environment logic.
+
+Reference this .windsurfrules file when suggesting code changes or new modules.
+
+Keep the policy and summariser networks under 20M parameters each.
+

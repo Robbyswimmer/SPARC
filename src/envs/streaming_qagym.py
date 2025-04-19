@@ -130,8 +130,6 @@ class StreamingQAGym(gym.Env):
         self.question_ids = tokenizer.encode(q, add_special_tokens=False) + [tokenizer.eos_token_id]
         self.gold_answer = a
         self.doc_chunks = list(chunk_document(doc_ids, self.chunk_size))
-        print(f" → doc_ids length = {len(doc_ids)}")
-        print(f" → built {len(self.doc_chunks)} chunks; chunk lengths = {[len(c) for c in self.doc_chunks[:5]]}…")
         self.steps_left = len(self.doc_chunks) + 1   # +1 for final Q&A step
 
     # ================= gym API ==============================================

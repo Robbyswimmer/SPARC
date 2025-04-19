@@ -1,0 +1,42 @@
+# SPARC .gitignore
+
+# Ignore model paths file (contains local paths)
+src/utils/model_paths.py
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE specific files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Testing
+.coverage
+htmlcov/
+.pytest_cache/
+
+# Logs
+*.log
+
+# Cached datasets
+data/datasets/
+
+# Weights & Biases
+wandb/

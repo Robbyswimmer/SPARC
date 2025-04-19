@@ -67,14 +67,28 @@ class WandbCallback(BaseCallback):
         )
 
     def _on_step(self) -> bool:
-        infos = self.locals.get("infos", [])
-        # Log any info dict containing qa_score or episode_reward
-        for info in infos:
-            if any(k in info for k in ("qa_score", "episode_reward")):
-                # flatten numpy types
-                clean = {k: float(v) if isinstance(v, (np.floating, np.integer)) else v
-                         for k, v in info.items()}
-                self._wandb.log(clean, step=self.num_timesteps)
+        # 1) grab everything SB3 has just recorded into its logger
+        sb3_metrics: dict = self.model.logger.name_to_value
+
+        # filter down to the 'train/' metrics you care about:
+        train_metrics = {k: v for k, v in sb3_metrics.items() if k.startswith("train/")}
+        # add a global step so WandB will put them on the x‑axis
+        train_metrics["global_step"] = self.num_timesteps
+        self._wandb.log(train_metrics)
+
+        # 2) now your QA metrics (if this step finished an episode)
+        infos = self.locals.get("infos")
+        if infos and "qa_score" in infos[0]:
+            info = infos[0]
+            self._wandb.log({
+                "episode_reward": info.get("episode_reward", 0.0),
+                "em":             info.get("exact_match",    0.0),
+                "f1":             info.get("f1",             0.0),
+                "qa_score":       info.get("qa_score",       0.0),
+                "tokens_used":    info.get("tokens_used",    0),
+                "generation_time":info.get("generation_time",0.0),
+                "global_step":    self.num_timesteps,
+            })
         return True
 
     def _on_training_end(self) -> None:
@@ -83,7 +97,7 @@ class WandbCallback(BaseCallback):
 
 # -----------------------------------------------------------------------------
 DEFAULT_CONFIG: Dict[str, Any] = {
-    "total_timesteps": 200_000,
+    "total_timesteps": 100_000,
     "learning_rate": 3e-5,
     "gamma": 0.99,
     "gae_lambda": 0.95,

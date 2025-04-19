@@ -18,6 +18,12 @@ def compute_em(gold: str, pred: str) -> float:
     """
     return float(normalize_text(gold) == normalize_text(pred))
 
+def compute_exact_match(pred: str, gold: str) -> float:
+    """
+    Alias for compute_em with reversed parameter order for consistency.
+    """
+    return compute_em(gold, pred)
+
 def compute_f1(gold: str, pred: str) -> float:
     """
     Word-level F1 score between gold and pred strings.

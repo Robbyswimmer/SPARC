@@ -5,11 +5,15 @@ from datasets import load_dataset
 from transformers import AutoTokenizer
 from utils.llm_interface import LLMInterface
 from utils.model_paths import llama_32_3b
+from utils.metrics import compute_exact_match, compute_f1, compute_qa_score
+
+import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # ------- helpers ------------------------------------------------------------
 _CHUNK_SIZE = 256                     # tokens per stream step
 _MAX_WINDOW = 2048                    # budget B
-_TOKENIZER_NAME = "NousResearch/Llama-2-7b-chat-hf"
+_TOKENIZER_NAME = "NousResearch/Meta-Llama-3.1-8B"
 
 # top‑level constants (tune later)
 ALPHA      = 0.15   # token cost
@@ -22,6 +26,10 @@ tokenizer = AutoTokenizer.from_pretrained(
     use_fast=True,
     add_eos_token=True
 )
+
+# ————— Fix for pad_token_id being None —————
+tokenizer.pad_token = tokenizer.eos_token
+tokenizer.pad_token_id = tokenizer.eos_token_id
 
 def chunk_document(doc_tokens, chunk_size=_CHUNK_SIZE):
     """Yield successive token chunks from a list of token ids."""
@@ -87,19 +95,6 @@ class StreamingQAGym(gym.Env):
         self.doc_chunks = None
         self.chunk_idx = 0
 
-    def _qa_score(self, pred, gold):
-        """Combine EM and F1 (word‑level) into a scalar 0‑1."""
-        pred_tokens = pred.lower().split()
-        gold_tokens = gold.lower().split()
-        common = set(pred_tokens) & set(gold_tokens)
-        if not pred_tokens or not gold_tokens:
-            return 0.0
-        precision = len(common) / len(pred_tokens)
-        recall    = len(common) / len(gold_tokens)
-        f1 = 2*precision*recall / (precision+recall + 1e-9)
-        em = float(pred.strip().lower() == gold.strip().lower())
-        return 0.5*em + 0.5*f1
-
     # ------------------------------------------------------------------------
     def _sample_episode(self):
         "Draw one (long_doc, question, answer) triplet & tokenise."
@@ -135,80 +130,175 @@ class StreamingQAGym(gym.Env):
         self.question_ids = tokenizer.encode(q, add_special_tokens=False) + [tokenizer.eos_token_id]
         self.gold_answer = a
         self.doc_chunks = list(chunk_document(doc_ids, self.chunk_size))
+        print(f" → doc_ids length = {len(doc_ids)}")
+        print(f" → built {len(self.doc_chunks)} chunks; chunk lengths = {[len(c) for c in self.doc_chunks[:5]]}…")
         self.steps_left = len(self.doc_chunks) + 1   # +1 for final Q&A step
 
     # ================= gym API ==============================================
     def reset(self, *, seed=None, options=None):
         self._reset_episode_state()
         self._sample_episode()
-        obs = np.array(self.doc_chunks[0], dtype=np.int32)
+        obs = self._pad(self.doc_chunks[0], self.chunk_size)
         info = {"step_idx": 0}
         return obs, info
 
+    # ================= Always return fixed length vector for stable baselines ==============================================
+    def _pad(self, obs_ids, target_len):
+        """Pad observation IDs to target length.
+        
+        Args:
+            obs_ids: List of token IDs or None
+            target_len: Target length to pad to
+            
+        Returns:
+            Numpy array of padded token IDs
+        """
+        # Handle None case
+        if obs_ids is None:
+            return np.full(target_len, tokenizer.pad_token_id, dtype=np.int32)
+        
+        # Handle empty list or non-list case
+        try:
+            if len(obs_ids) == 0:
+                return np.full(target_len, tokenizer.pad_token_id, dtype=np.int32)
+        except (TypeError, AttributeError):
+            # If obs_ids is not a list or doesn't have a length
+            print(f"Warning: Invalid obs_ids type: {type(obs_ids)}")
+            return np.full(target_len, tokenizer.pad_token_id, dtype=np.int32)
+            
+        # Check if all elements are valid integers
+        try:
+            # Convert any non-integer elements to pad token
+            obs_ids = [int(x) if isinstance(x, (int, float, str)) and str(x).strip() 
+                      else tokenizer.pad_token_id for x in obs_ids]
+        except (ValueError, TypeError):
+            # If conversion fails, create a safe array
+            print(f"Warning: Invalid elements in obs_ids")
+            return np.full(target_len, tokenizer.pad_token_id, dtype=np.int32)
+            
+        # Normal padding case
+        if len(obs_ids) < target_len:
+            obs_ids = obs_ids + [tokenizer.pad_token_id] * (target_len - len(obs_ids))
+        else:
+            obs_ids = obs_ids[:target_len]
+            
+        # Final safety check before creating numpy array
+        try:
+            return np.array(obs_ids, dtype=np.int32)
+        except (ValueError, TypeError) as e:
+            print(f"Error creating numpy array: {e}")
+            return np.full(target_len, tokenizer.pad_token_id, dtype=np.int32)
+
    # ------------------------------------------------------------------------
     def step(self, action):
-        global_token_cost = 0.0     # add to reward later
-
-        # Validate chunk_idx is within bounds
+        """
+        Returns:
+            obs       : np.ndarray[int32]  # shape=(chunk_size,)
+            reward    : float
+            terminated: bool
+            truncated : bool (always False)
+            info      : dict
+        """
+        # ------------------------
+        # 1) Did we already finish streaming?
+        # ------------------------
         if self.chunk_idx >= len(self.doc_chunks):
-            # We've reached the end of the document
-            # This should be handled by the question/answer phase
-            done = True
-            obs = np.zeros(self.chunk_size, dtype=np.int32)
-            info = {
-                "step_idx": self.chunk_idx,
-                "error": "Reached end of document chunks"
-            }
-            return obs, 0.0, done, False, info
+            # -- question arrival (show question but don't terminate) --
+            if self.chunk_idx == len(self.doc_chunks):
+                obs  = self._pad(self.question_ids, self.chunk_size)
+                info = {"step_idx": self.chunk_idx, "question": True}
+                return obs, 0.0, False, False, info
 
-        if action == 1:   # KEEP
-            self.stored_tokens.extend(self.doc_chunks[self.chunk_idx])
-            global_token_cost += BETA_KEEP
-            step_penalty = -GAMMA_STEP
-        else:             # DROP
-            step_penalty = 0.0
-
-        # COMPRESS will come later:
-        # elif action == 2: ...
-
-        self.chunk_idx += 1
-        done = False
-        reward = step_penalty          # start with per‑step shaping
-
-        # ---------- question just arrived -----------------
-        if self.chunk_idx == len(self.doc_chunks):
-            obs = np.array(self.question_ids[:self.chunk_size], dtype=np.int32)
-            info = {"step_idx": self.chunk_idx, "question": True}
-            return obs, reward, done, False, info
-
-        # ---------- answer phase -------------------------
-        if self.chunk_idx > len(self.doc_chunks):
-            context = self.stored_tokens[-self.max_window:]
+            # -- answer phase (final reward + terminate) --
+            # Build prompt from kept tokens + question
+            context    = self.stored_tokens[-self.max_window:]
             prompt_ids = context + self.question_ids
-            predicted = self._query_llm(prompt_ids)
 
-            qa_score = self._qa_score(predicted, self.gold_answer)
+            # Query LLM and score
+            model_answer  = self._query_llm(prompt_ids)
+            em      = compute_exact_match(model_answer, self.gold_answer)
+            f1      = compute_f1(model_answer, self.gold_answer)
+            qa_score      = compute_qa_score(model_answer, self.gold_answer)
             token_penalty = ALPHA * (len(prompt_ids) / self.max_window)
-            reward += qa_score - token_penalty - global_token_cost
-            done = True
-            obs = np.zeros(self.chunk_size, dtype=np.int32)
-            info = {
-                "step_idx": self.chunk_idx,
-                "qa_score": qa_score,
-                "tokens_used": len(prompt_ids),
-                "model_answer": predicted,
-                "gold_answer": self.gold_answer
-            }
-            return obs, reward, done, False, info
+            reward        = qa_score - token_penalty
 
-        # ---------- normal streaming -------------
-        obs = np.array(self.doc_chunks[self.chunk_idx], dtype=np.int32)
-        info = {"step_idx": self.chunk_idx}
-        return obs, reward, done, False, info
+            # Return an “empty” obs and terminate
+            obs = np.full(self.chunk_size, tokenizer.pad_token_id, dtype=np.int32)
+            info = {
+                "step_idx":     self.chunk_idx,
+                "exact_match":  em,
+                "f1":           f1,
+                "qa_score":     qa_score,
+                "tokens_used":  len(prompt_ids),
+                "model_answer": model_answer,
+                "gold_answer":  self.gold_answer,
+            }
+            return obs, reward, True, False, info
+
+        # ------------------------
+        # 2) Still in streaming phase: apply action cost + extend tokens
+        # ------------------------
+        if action == 1:  # KEEP
+            self.stored_tokens.extend(self.doc_chunks[self.chunk_idx])
+            reward = - (GAMMA_STEP + BETA_KEEP)
+        else:            # DROP (or future COMPRESS)
+            reward = 0.0
+
+        # ------------------------
+        # 3) Advance to next chunk index
+        # ------------------------
+        self.chunk_idx += 1
+
+        # ------------------------
+        # 4) Now decide what to show next
+        # ------------------------
+        # 4a) Still more chunks?
+        if self.chunk_idx < len(self.doc_chunks):
+            obs  = self._pad(self.doc_chunks[self.chunk_idx], self.chunk_size)
+            info = {"step_idx": self.chunk_idx}
+            return obs, reward, False, False, info
+
+        # 4b) Exactly at question
+        if self.chunk_idx == len(self.doc_chunks):
+            obs  = self._pad(self.question_ids, self.chunk_size)
+            info = {"step_idx": self.chunk_idx, "question": True}
+            return obs, reward, False, False, info
+
     # ------------------------------------------------------------------------
     def _query_llm(self, prompt_ids):
         """
         Call your frozen LLM in eval-only mode.
+        
+        Args:
+            prompt_ids: List of token IDs for the prompt
+            
+        Returns:
+            Generated text response
         """
-        return self.llm.generate(prompt_ids, max_tokens=512, stop=["\n"])
+        # Convert token IDs to text
+        prompt_text = tokenizer.decode(prompt_ids, skip_special_tokens=True)
+        
+        # Extract the question from the prompt (assuming it's at the end)
+        question_text = tokenizer.decode(self.question_ids, skip_special_tokens=True)
+        
+        # Create a system prompt
+        system_prompt = "You are a helpful, accurate, and concise assistant. Answer questions based on the provided document."
+        
+        # Format the prompt for our improved LLMInterface
+        context_text = prompt_text.replace(question_text, "")
+        user_message = f"Document: {context_text}\n\nQuestion: {question_text}\n\nProvide a direct and concise answer."
+        
+        # Generate the answer using our improved interface
+        try:
+            return self.llm.generate_text(
+                user_message=user_message,
+                system_prompt=system_prompt,
+                max_tokens=256,
+                temperature=0.0,
+                stop=["\n\n", "Human:", "Document:", "Question:"]
+            )
+        except Exception as e:
+            print(f"Error in LLM generation: {e}")
+            # Fallback to legacy method if needed
+            return self.llm.generate(prompt_ids, max_tokens=256, stop=["\n"])
 

@@ -50,12 +50,14 @@ class StreamingQAGym(gym.Env):
                  dataset_name: str = "deepmind/narrativeqa",
                  split: str = "train",
                  max_window: int = _MAX_WINDOW,
+                 data_iter: Iterable[Dict[str, Any]] = None,
                  chunk_size: int = _CHUNK_SIZE,
                  seed: int | None = None):
         super().__init__()
 
         self.dataset_name = dataset_name
         self.split = split
+        self.data_iter = data_iter
         self.max_window = max_window
         self.chunk_size = chunk_size
         self.rng = np.random.default_rng(seed)

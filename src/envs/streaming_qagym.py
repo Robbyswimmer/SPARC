@@ -52,6 +52,8 @@ class StreamingQAGym(gym.Env):
                  max_window: int = _MAX_WINDOW,
                  data_iter: Iterable[Dict[str, Any]] = None,
                  chunk_size: int = _CHUNK_SIZE,
+                 token_reward_max: float = 0.1,      # Maximum per-episode token reward
+                 token_reward_anneal_steps: int = 50000,  # Steps to anneal token rewards to 10%
                  seed: int | None = None):
         super().__init__()
 
@@ -60,6 +62,12 @@ class StreamingQAGym(gym.Env):
         self.ds_iter = data_iter
         self.max_window = max_window
         self.chunk_size = chunk_size
+        
+        # Token reward parameters
+        self.token_reward_max = token_reward_max
+        self.token_reward_anneal_steps = token_reward_anneal_steps
+        self.global_step = 0  # Will be updated externally
+        
         self.rng = np.random.default_rng(seed)
 
         # Load LLM interface
@@ -232,13 +240,26 @@ class StreamingQAGym(gym.Env):
             # Apply base cost for keeping
             reward = - (GAMMA_STEP + BETA_KEEP)
             
-            # Add heuristic reward if gold answer tokens present in this chunk
+            # Add dynamic heuristic reward if gold answer tokens present in this chunk
             if self.gold_answer_token_ids:
                 # Check for overlap between current chunk and gold answer tokens
                 overlap = set(current_chunk) & self.gold_answer_token_ids
                 if overlap:
-                    # Add +0.01 for finding gold answer tokens
-                    reward += 0.01
+                    # Dynamic scaling based on answer length and training progress
+                    token_hit = len(overlap)  # Count number of matching tokens
+                    
+                    # Scale per-token reward (max total = token_reward_max)
+                    if len(self.gold_answer_token_ids) > 0:  # Avoid division by zero
+                        per_token = self.token_reward_max / len(self.gold_answer_token_ids)
+                    else:
+                        per_token = 0.01  # Fallback if no gold tokens
+                    
+                    # Anneal rewards over time (start strong, fade to 10%)
+                    anneal = max(0.1, 1.0 - self.global_step / self.token_reward_anneal_steps) 
+                    
+                    # Apply the scaled and annealed reward
+                    token_reward = token_hit * per_token * anneal
+                    reward += token_reward
         else:            # DROP (or future COMPRESS)
             reward = 0.0
 
@@ -299,4 +320,8 @@ class StreamingQAGym(gym.Env):
             print(f"Error in LLM generation: {e}")
             # Fallback to legacy method if needed
             return self.llm.generate(prompt_ids, max_tokens=256, stop=["\n"])
+
+    def set_global_step(self, step: int):
+        """Set the global training step for reward annealing."""
+        self.global_step = step
 

@@ -11,6 +11,7 @@ from typing import Optional
 from envs.streaming_qagym import StreamingQAGym
 from agents.ppo_agent import TokenEmbedExtractor, WandbCallback
 from agents.entropy_schedule import EntropyScheduleCallback
+from agents.global_step_callback import GlobalStepCallback
 from data.narrativeqa import load_narrativeqa
 from data.hotpotqa    import load_hotpotqa
 from curricula.length_schedule import LengthScheduleWrapper
@@ -128,12 +129,17 @@ def main(cfg: DictConfig):
     entropy_callback = EntropyScheduleCallback(
         start_coef=0.05,
         end_coef=0.0,
-        decay_fraction=0.5,  # Decay over first half of total training
+        decay_fraction=0.5,  # Decay over first half of training
         total_timesteps=cfg.train.total_steps,
         verbose=1
     )
     callbacks.append(entropy_callback)
     print("Using entropy scheduling to control exploration")
+    
+    # Add global step callback for token reward annealing
+    global_step_callback = GlobalStepCallback(verbose=1)
+    callbacks.append(global_step_callback)
+    print("Using global step tracking for token reward annealing")
     
     model.learn(
         total_timesteps = cfg.train.total_steps,

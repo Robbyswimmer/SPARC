@@ -51,7 +51,13 @@ def load_hotpotqa(
     logger.info(f"Loading HotpotQA (fullwiki) dataset, split: {split}")
     try:
         # Use streaming=True for large datasets if memory becomes an issue
-        dataset: Dataset = load_dataset("hotpot_qa", "fullwiki", split=split, streaming=False)
+        dataset: Dataset = load_dataset(
+            "hotpot_qa", 
+            "fullwiki", 
+            split=split, 
+            streaming=False,
+            trust_remote_code=True
+        )
     except Exception as e:
         logger.error(f"Failed to load HotpotQA dataset: {e}")
         return

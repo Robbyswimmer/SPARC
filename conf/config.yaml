@@ -1,8 +1,8 @@
 exp:
   name: sparc_ppo_longctx
 data:
+  datasets: [narrativeqa, hotpotqa]  # Multiple datasets to use
   split: train
-  datasets: [narrativeqa, hotpotqa]
 env:
   chunk_size: 256
   max_window: 2048
@@ -27,3 +27,7 @@ train:
   clip_range: 0.2
 wandb:
   project: SPARC
+eval:
+  frequency: 10   # Evaluate every 10k steps
+  episodes: 20      # Number of episodes to evaluate on
+  deterministic: true

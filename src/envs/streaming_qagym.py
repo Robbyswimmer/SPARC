@@ -1,7 +1,7 @@
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
-from typing import Iterable, Dict, Any
+from typing import Iterable, Dict, Any, Tuple, List, Callable
 from transformers import AutoTokenizer
 from utils.llm_interface import LLMInterface
 from utils.model_paths import llama_32_3b
@@ -50,7 +50,7 @@ class StreamingQAGym(gym.Env):
                  dataset_name: str = "deepmind/narrativeqa",
                  split: str = "train",
                  max_window: int = _MAX_WINDOW,
-                 data_iter: Iterable[Dict[str, Any]] = None,
+                 data_loader_fn: Callable[[], Iterable[Tuple[List[List[int]], List[int], str]]] = None,
                  chunk_size: int = _CHUNK_SIZE,
                  token_reward_max: float = 0.1,      # Maximum per-episode token reward
                  token_reward_anneal_steps: int = 50000,  # Steps to anneal token rewards to 10%
@@ -59,7 +59,8 @@ class StreamingQAGym(gym.Env):
 
         self.dataset_name = dataset_name
         self.split = split
-        self.ds_iter = data_iter
+        self.data_loader_fn = data_loader_fn
+        self.ds_iter = iter(self.data_loader_fn()) if self.data_loader_fn is not None else None
         self.max_window = max_window
         self.chunk_size = chunk_size
         
@@ -104,29 +105,46 @@ class StreamingQAGym(gym.Env):
 
     # ------------------------------------------------------------------------
     def _sample_episode(self):
-        "Draw one (long_doc, question, answer) triplet from data loader."
+        """Draw one (long_doc, question, answer) triplet from data loader.
+        If the iterator is exhausted, recreate it by calling the loader function."""
         
+        if self.ds_iter is None:
+            if self.data_loader_fn is None:
+                raise RuntimeError("Dataset loader function was not provided during initialization.")
+            else:
+                # Attempt to create iterator if it wasn't created initially
+                self.ds_iter = iter(self.data_loader_fn())
+            
         # Get the next tuple of (doc_chunks, question_ids, gold_answer)
         try:
             doc_chunks, question_ids, gold_answer = next(self.ds_iter)  # throws StopIteration when exhausted
+        except StopIteration:
+            if self.data_loader_fn is None:
+                raise RuntimeError("Cannot reset iterator: Dataset loader function was not provided.")
+                 
+            # If iterator is exhausted, recreate it by calling the loader function again
+            print("[StreamingQAGym] Data iterator exhausted. Resetting by calling data_loader_fn.")
+            self.ds_iter = iter(self.data_loader_fn()) # Reset the iterator using the loader function
+            try:
+                doc_chunks, question_ids, gold_answer = next(self.ds_iter)
+            except StopIteration:
+                # If still no data after reset, the loader function might be returning an empty/exhausted iterator
+                raise RuntimeError("Dataset loader function failed to yield any examples after reset")
             
-            # Store the values directly from the tuple - they're already tokenized and chunked
-            self.doc_chunks = doc_chunks
-            self.question_ids = question_ids
-            self.gold_answer = gold_answer
-            
-            # Tokenize gold answer for heuristic rewards
-            gold_answer_tokens = tokenizer(self.gold_answer, add_special_tokens=False).input_ids
-            self.gold_answer_token_ids = set(gold_answer_tokens)
-            
-            self.chunk_idx = 0
-            
-            # Set the number of steps for this episode
-            self.steps_left = len(self.doc_chunks) + 1   # +1 for final Q&A step
-            
-        except Exception as e:
-            print(f"Error loading next episode: {e}")
-            raise
+        # Store the values directly from the tuple - they're already tokenized and chunked
+        self.doc_chunks = doc_chunks
+        self.question_ids = question_ids
+        self.gold_answer = gold_answer
+        
+        # Tokenize gold answer for heuristic rewards
+        gold_answer_tokens = tokenizer(self.gold_answer, add_special_tokens=False).input_ids
+        self.gold_answer_token_ids = set(gold_answer_tokens)
+        
+        # Reset episode state counters
+        self.chunk_idx = 0
+        
+        # Set the number of steps for this episode
+        self.steps_left = len(self.doc_chunks) + 1   # +1 for final Q&A step
 
     # ================= gym API ==============================================
     def reset(self, *, seed=None, options=None):
@@ -324,4 +342,3 @@ class StreamingQAGym(gym.Env):
     def set_global_step(self, step: int):
         """Set the global training step for reward annealing."""
         self.global_step = step
-

@@ -12,6 +12,7 @@ from envs.streaming_qagym import StreamingQAGym
 from agents.ppo_agent import TokenEmbedExtractor, WandbCallback
 from agents.entropy_schedule import EntropyScheduleCallback
 from agents.global_step_callback import GlobalStepCallback
+from agents.eval_callback import ValidationCallback
 from data.narrativeqa import load_narrativeqa
 from data.hotpotqa    import load_hotpotqa
 from curricula.length_schedule import LengthScheduleWrapper
@@ -61,20 +62,31 @@ def main(cfg: DictConfig):
         tokenizer.pad_token = tokenizer.eos_token
         print(f"Set pad_token to eos_token: {tokenizer.pad_token}")
 
-    # 1) Build joint iterable over chosen datasets
-    loaders = [DATASETS[name](tokenizer=tokenizer,split=cfg.data.split) for name in cfg.data.datasets]
-    mixed_loader = itertools.cycle(itertools.chain(*loaders))  # simple round‑robin
+    # Build joint iterable over chosen datasets for training
+    loaders = [DATASETS[name](tokenizer=tokenizer, split=cfg.data.split) for name in cfg.data.datasets]
+    train_loader = itertools.cycle(itertools.chain(*loaders))  # Round-robin between datasets
+    
+    # Create a separate validation data loader function
+    # This will be called each time validation runs to get fresh data
+    def get_validation_data():
+        # For validation, use a mix of validation data from all datasets
+        val_loaders = []
+        for name in cfg.data.datasets:
+            # Limited number of samples per dataset for validation
+            val_loaders.append(DATASETS[name](tokenizer=tokenizer, split="validation", max_samples=50))
+        return itertools.chain(*val_loaders)
 
     # 2) Create curriculum wrapper if requested
     curriculum_wrapper = None
     if cfg.curriculum.enabled:
+        print(f"Using curriculum: {cfg.curriculum.start_chunks} → {cfg.curriculum.max_chunks} chunks")
         curriculum_wrapper = LengthScheduleWrapper(
-            mixed_loader,
+            base_iterator=train_loader,
             initial_max_chunks=cfg.curriculum.start_chunks,
             final_max_chunks=cfg.curriculum.max_chunks, 
             total_schedule_steps=cfg.curriculum.growth_steps,
         )
-        mixed_loader = curriculum_wrapper
+        train_loader = curriculum_wrapper
 
     # 3) Factory to create fresh envs that consume the loader
     def make_env(seed=None):
@@ -82,7 +94,7 @@ def main(cfg: DictConfig):
             return StreamingQAGym(
                 chunk_size   = cfg.env.chunk_size,
                 max_window   = cfg.env.max_window,
-                data_iter    = mixed_loader,   # pass iterator
+                data_loader_fn = lambda: train_loader,   # Changed param name & wrapped in lambda
                 seed         = seed,
             )
         return _thunk
@@ -140,6 +152,17 @@ def main(cfg: DictConfig):
     global_step_callback = GlobalStepCallback(verbose=1)
     callbacks.append(global_step_callback)
     print("Using global step tracking for token reward annealing")
+    
+    # Add validation callback for performance tracking on held-out data
+    validation_callback = ValidationCallback(
+        eval_freq=cfg.eval.frequency,      # How often to evaluate
+        eval_episodes=cfg.eval.episodes,   # Number of validation episodes
+        data_loader_fn=get_validation_data,  # Validation data loader function
+        n_eval_envs=1,                     # Single environment for validation
+        verbose=1
+    )
+    callbacks.append(validation_callback)
+    print(f"Using validation tracking every {cfg.eval.frequency} steps")
     
     model.learn(
         total_timesteps = cfg.train.total_steps,

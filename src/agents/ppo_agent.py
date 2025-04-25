@@ -52,11 +52,21 @@ class TokenEmbedExtractor(BaseFeaturesExtractor):
 # -----------------------------------------------------------------------------
 class WandbCallback(BaseCallback):
     """Log raw env info dicts to Weights & Biases."""
-    def __init__(self, project: str, run_name: str, **kwargs):
+    def __init__(self, project: str, run_name: str, ema_alpha: float = 0.05, **kwargs):
         super().__init__(**kwargs)
         self.project = project
         self.run_name = run_name
         self._wandb = None
+        
+        # EMA tracking for smoothed metrics
+        self.ema_alpha = ema_alpha  # Lower alpha = more smoothing (0.05 is quite smooth)
+        self.smoothed_metrics = {
+            "qa_score_ema": None,
+            "f1_ema": None,
+            "em_ema": None,
+            "episode_reward_ema": None,
+            "tokens_used_ema": None
+        }
 
     def _on_training_start(self) -> None:
         self._wandb = wandb.init(
@@ -99,8 +109,31 @@ class WandbCallback(BaseCallback):
                 tokens_used = info.get("tokens_used", None)
 
                 if qa_score is not None:
+                    # Update EMAs
+                    episode_reward = episode_info.get("r", 0.0)
+                    
+                    # Update each EMA
+                    for metric_name, current_value in [
+                        ("qa_score_ema", qa_score),
+                        ("f1_ema", f1),
+                        ("em_ema", em),
+                        ("episode_reward_ema", episode_reward),
+                        ("tokens_used_ema", tokens_used)
+                    ]:
+                        if current_value is not None:
+                            if self.smoothed_metrics[metric_name] is None:
+                                # Initialize with first value
+                                self.smoothed_metrics[metric_name] = current_value
+                            else:
+                                # EMA update: new_ema = alpha * current + (1-alpha) * old_ema
+                                self.smoothed_metrics[metric_name] = (
+                                    self.ema_alpha * current_value + 
+                                    (1 - self.ema_alpha) * self.smoothed_metrics[metric_name]
+                                )
+                    
+                    # Log both raw and smoothed metrics
                     log_data = {
-                        "episode_reward": episode_info.get("r", 0.0),
+                        "episode_reward": episode_reward,
                         "episode_length": episode_info.get("l", 0), 
                         "em": em,
                         "f1": f1,
@@ -108,6 +141,12 @@ class WandbCallback(BaseCallback):
                         "tokens_used": tokens_used,
                         "global_step": self.num_timesteps,
                     }
+                    
+                    # Add smoothed metrics to log data
+                    for metric_name, smoothed_value in self.smoothed_metrics.items():
+                        if smoothed_value is not None:
+                            log_data[metric_name] = smoothed_value
+                    
                     log_data = {k: v for k, v in log_data.items() if v is not None}
                     self._wandb.log(log_data)
                 else:

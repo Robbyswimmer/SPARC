@@ -9,6 +9,8 @@ from stable_baselines3.common.evaluation import evaluate_policy
 from stable_baselines3.common.vec_env import DummyVecEnv
 import numpy as np
 import wandb
+import warnings
+import os
 from typing import Callable, Dict, Any, Optional, List, Union
 import time
 import gymnasium as gym
@@ -21,15 +23,17 @@ class ValidationCallback(BaseCallback):
     
     This callback periodically evaluates the model on a validation environment
     and logs metrics to track performance independent of the training data.
+    It also saves the best model found so far based on mean reward.
     
     Args:
         eval_freq: Evaluate every `eval_freq` timesteps
         eval_episodes: Number of episodes to evaluate on
         data_loader_fn: Function that returns a validation data iterator
+        save_path: Path to save the best model checkpoint
+        name_prefix: Prefix for the saved model file
+        n_eval_envs: Number of parallel environments for evaluation
         verbose: Verbosity level (0: no output, 1: info, 2: debug)
         deterministic: Whether to use deterministic actions during evaluation
-        use_masking: Whether to use action masking during evaluation
-        log_path: Path to save evaluation logs
     """
     
     def __init__(
@@ -38,9 +42,10 @@ class ValidationCallback(BaseCallback):
         eval_episodes: int = 20,
         data_loader_fn: Callable[[], Any] = None,
         n_eval_envs: int = 1,
+        save_path: str = "./checkpoints/",
+        name_prefix: str = "best_model",
         verbose: int = 1,
         deterministic: bool = True,
-        log_path: Optional[str] = None,
     ):
         super().__init__(verbose=verbose)
         self.eval_freq = eval_freq
@@ -48,11 +53,11 @@ class ValidationCallback(BaseCallback):
         self.data_loader_fn = data_loader_fn
         self.n_eval_envs = n_eval_envs
         self.deterministic = deterministic
-        self.log_path = log_path
+        self.save_path = save_path
+        self.name_prefix = name_prefix
         
         # Initialize metrics storage
-        self.last_mean_reward = 0.0
-        self.last_reward_std = 0.0
+        self.best_mean_reward = -np.inf
         self.last_metrics = {}
         
         # Validation environment will be created in _on_training_start
@@ -161,11 +166,7 @@ class ValidationCallback(BaseCallback):
         mean_length = np.mean(episode_lengths)
         
         # Store for later reference
-        self.last_mean_reward = mean_reward
-        self.last_reward_std = std_reward
-        
-        # Prepare metrics for logging
-        eval_metrics = {
+        self.last_metrics = {
             "eval/mean_reward": mean_reward,
             "eval/std_reward": std_reward,
             "eval/mean_length": mean_length,
@@ -174,22 +175,34 @@ class ValidationCallback(BaseCallback):
         
         # Add QA metrics if available
         if qa_scores:
-            eval_metrics.update({
+            self.last_metrics.update({
                 "eval/mean_qa_score": np.mean(qa_scores),
                 "eval/mean_em": np.mean(em_scores),
                 "eval/mean_f1": np.mean(f1_scores),
                 "eval/mean_tokens_used": np.mean(tokens_used),
             })
         
-        # Store metrics
-        self.last_metrics = eval_metrics
+        # Save best model
+        if mean_reward > self.best_mean_reward:
+            if self.verbose > 0:
+                print(f"New best mean reward: {mean_reward:.3f} (old: {self.best_mean_reward:.3f}). Saving model...")
+            self.best_mean_reward = mean_reward
+            # Create save directory if it doesn't exist
+            os.makedirs(self.save_path, exist_ok=True)
+            save_filename = os.path.join(self.save_path, f"{self.name_prefix}.zip")
+            self.model.save(save_filename)
+            if self.verbose > 0:
+                print(f"Model saved to {save_filename}")
+        else:
+            if self.verbose > 0:
+                print(f"Mean reward {mean_reward:.3f} did not improve over best {self.best_mean_reward:.3f}.")
         
         # Log to wandb if available
         try:
             import wandb
             if wandb.run is not None:
                 # Log scalar metrics
-                wandb.log(eval_metrics)
+                wandb.log(self.last_metrics)
                 
                 # Log histograms for distributions
                 if len(episode_rewards) > 1:  # Only create histograms if we have multiple episodes

@@ -159,11 +159,13 @@ def main(cfg: DictConfig):
         eval_episodes=cfg.eval.episodes,   # Number of validation episodes
         data_loader_fn=get_validation_data,  # Validation data loader function
         n_eval_envs=1,                     # Single environment for validation
+        save_path=cfg.eval.save_path,      # Path to save best model
+        name_prefix=cfg.eval.name_prefix,  # Prefix for best model file
         verbose=1
     )
     callbacks.append(validation_callback)
-    print(f"Using validation tracking every {cfg.eval.frequency} steps")
-    
+    print("Using validation callback for performance tracking and checkpointing")
+
     model.learn(
         total_timesteps = cfg.train.total_steps,
         callback        = callbacks

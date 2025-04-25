@@ -31,3 +31,5 @@ eval:
   frequency: 10   # Evaluate every 10k steps
   episodes: 20      # Number of episodes to evaluate on
   deterministic: true
+  save_path: "./checkpoints/" # Directory to save best model checkpoints
+  name_prefix: "sparc_best_model" # Prefix for the best model filename

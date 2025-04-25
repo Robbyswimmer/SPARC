@@ -11,6 +11,11 @@ curriculum:
   start_chunks: 2
   max_chunks: 10
   growth_steps: 50_000
+model:
+  tokenizer: NousResearch/Meta-Llama-3.1-8B
+  embed_dim: 128
+  vocab_size: 128256
+  net_arch: [{pi: [128, 64], vf: [128, 64]}]
 train:
   n_envs: 8
   total_steps: 1_000_000
@@ -20,9 +25,5 @@ train:
   gamma: 0.99
   gae_lambda: 0.95
   clip_range: 0.2
-model:
-  embed_dim: 128
-  vocab_size: 128256
-  net_arch: [{pi: [128,64], vf: [128,64]}]
 wandb:
   project: SPARC

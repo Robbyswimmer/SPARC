@@ -1,7 +1,7 @@
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
-from datasets import load_dataset
+from typing import Iterable, Dict, Any
 from transformers import AutoTokenizer
 from utils.llm_interface import LLMInterface
 from utils.model_paths import llama_32_3b
@@ -16,7 +16,7 @@ _MAX_WINDOW = 2048                    # budget B
 _TOKENIZER_NAME = "NousResearch/Meta-Llama-3.1-8B"
 
 # top‑level constants (tune later)
-ALPHA      = 0.15   # token cost
+ALPHA      = 0.05   # token cost
 BETA_KEEP  = 0.005  # keep penalty
 BETA_COMP  = 0.002  # compress penalty
 GAMMA_STEP = 0.001  # per‑step thrift penalty
@@ -57,7 +57,7 @@ class StreamingQAGym(gym.Env):
 
         self.dataset_name = dataset_name
         self.split = split
-        self.data_iter = data_iter
+        self.ds_iter = data_iter
         self.max_window = max_window
         self.chunk_size = chunk_size
         self.rng = np.random.default_rng(seed)
@@ -81,58 +81,44 @@ class StreamingQAGym(gym.Env):
         # scalar: 0=DROP, 1=KEEP
         self.action_space = spaces.Discrete(2)
 
-        # ------------- load dataset iterator --------------------------------
-        self.ds_iter = iter(
-            load_dataset(dataset_name, split=split, streaming=True, trust_remote_code=True)
-        )
         self._reset_episode_state()
 
     # ------------------------------------------------------------------------
     def _reset_episode_state(self):
-        "Prepare a fresh doc‑question pair."
+        """Prepare a fresh doc‑question pair."""
+        self.doc_chunks = None
         self.stored_tokens = []            # rolling context buffer
-        self.steps_left = None             # filled during reset()
         self.question_ids = None
         self.gold_answer = None
-        self.doc_chunks = None
+        self.gold_answer_token_ids = set()  # Will hold tokenized gold answer for heuristic rewards
         self.chunk_idx = 0
+        self.steps_left = None             # filled during reset()
 
     # ------------------------------------------------------------------------
     def _sample_episode(self):
-        "Draw one (long_doc, question, answer) triplet & tokenise."
-        ex = next(self.ds_iter)                    # throws StopIteration when exhausted
+        "Draw one (long_doc, question, answer) triplet from data loader."
         
-        # Print the keys to debug dataset structure
-        print(f"Dataset example keys: {list(ex.keys())}")
-        
-        # For demonstration purposes, we'll generate a synthetic document
-        # since the actual document in the dataset is too short (9 chars)
-        doc_text = "This is a synthetic document for testing the StreamingQAGym environment. "
-        doc_text += "It contains information about Miss Delmer, who is the elderly spinster aunt "
-        doc_text += "of the Earl de Verseley and Captain Delmar. She lives in a small cottage "
-        doc_text += "on the outskirts of the village and is known for her kindness to animals. "
-        doc_text *= 10  # Repeat to make it longer (about 1000+ chars)
-        
-        # Extract question from dictionary if needed
-        q = ex["question"]
-        if isinstance(q, dict) and "text" in q:
-            q = q["text"]
-        
-        # Extract answer
-        if "answers" in ex and isinstance(ex["answers"], list):
-            a = ex["answers"][0] if isinstance(ex["answers"][0], str) else ex["answers"][0].get('text', '')
-        else:
-            a = "the elderly spinster aunt of the Earl de Verseley and Captain Delmar"
+        # Get the next tuple of (doc_chunks, question_ids, gold_answer)
+        try:
+            doc_chunks, question_ids, gold_answer = next(self.ds_iter)  # throws StopIteration when exhausted
             
-        print(f"Using document length: {len(doc_text)} chars")
-        print(f"Question: {q}")
-        print(f"Answer: {a}")
-
-        doc_ids = tokenizer.encode(doc_text, add_special_tokens=False)
-        self.question_ids = tokenizer.encode(q, add_special_tokens=False) + [tokenizer.eos_token_id]
-        self.gold_answer = a
-        self.doc_chunks = list(chunk_document(doc_ids, self.chunk_size))
-        self.steps_left = len(self.doc_chunks) + 1   # +1 for final Q&A step
+            # Store the values directly from the tuple - they're already tokenized and chunked
+            self.doc_chunks = doc_chunks
+            self.question_ids = question_ids
+            self.gold_answer = gold_answer
+            
+            # Tokenize gold answer for heuristic rewards
+            gold_answer_tokens = tokenizer(self.gold_answer, add_special_tokens=False).input_ids
+            self.gold_answer_token_ids = set(gold_answer_tokens)
+            
+            self.chunk_idx = 0
+            
+            # Set the number of steps for this episode
+            self.steps_left = len(self.doc_chunks) + 1   # +1 for final Q&A step
+            
+        except Exception as e:
+            print(f"Error loading next episode: {e}")
+            raise
 
     # ================= gym API ==============================================
     def reset(self, *, seed=None, options=None):
@@ -207,6 +193,7 @@ class StreamingQAGym(gym.Env):
             if self.chunk_idx == len(self.doc_chunks):
                 obs  = self._pad(self.question_ids, self.chunk_size)
                 info = {"step_idx": self.chunk_idx, "question": True}
+                self.chunk_idx += 1
                 return obs, 0.0, False, False, info
 
             # -- answer phase (final reward + terminate) --
@@ -239,8 +226,19 @@ class StreamingQAGym(gym.Env):
         # 2) Still in streaming phase: apply action cost + extend tokens
         # ------------------------
         if action == 1:  # KEEP
-            self.stored_tokens.extend(self.doc_chunks[self.chunk_idx])
+            current_chunk = self.doc_chunks[self.chunk_idx]
+            self.stored_tokens.extend(current_chunk)
+            
+            # Apply base cost for keeping
             reward = - (GAMMA_STEP + BETA_KEEP)
+            
+            # Add heuristic reward if gold answer tokens present in this chunk
+            if self.gold_answer_token_ids:
+                # Check for overlap between current chunk and gold answer tokens
+                overlap = set(current_chunk) & self.gold_answer_token_ids
+                if overlap:
+                    # Add +0.01 for finding gold answer tokens
+                    reward += 0.01
         else:            # DROP (or future COMPRESS)
             reward = 0.0
 

@@ -1,16 +1,16 @@
 # src/curricula/length_schedule.py
 
-from typing import Dict, Any, Iterable, Iterator
+from typing import Dict, Any, Iterable, Iterator, List, Tuple, Union
 import numpy as np
 
-class LengthScheduleWrapper(Iterator[Dict[str, Any]]):
+class LengthScheduleWrapper(Iterator[Tuple[List[List[int]], List[int], str]]):
     """
     A curriculum wrapper that linearly increases the maximum number of document
     chunks exposed per episode over a specified number of training steps.
 
     Args:
-        base_iterator (Iterable[Dict[str, Any]]): The underlying data iterator
-            providing full episodes (e.g., document chunks, question, answer).
+        base_iterator (Iterable[Tuple[List[List[int]], List[int], str]]): The underlying data iterator
+            providing full episodes as tuples of (doc_chunks, question_ids, gold_answer).
         initial_max_chunks (int): The maximum number of chunks allowed at the start.
         final_max_chunks (int): The maximum number of chunks allowed at the end.
         total_schedule_steps (int): The total number of training steps over which
@@ -18,7 +18,7 @@ class LengthScheduleWrapper(Iterator[Dict[str, Any]]):
         min_chunks (int): A minimum number of chunks to always include. Defaults to 1.
     """
     def __init__(self,
-                 base_iterator: Iterable[Dict[str, Any]],
+                 base_iterator: Iterable[Tuple[List[List[int]], List[int], str]],
                  initial_max_chunks: int,
                  final_max_chunks: int,
                  total_schedule_steps: int,
@@ -30,7 +30,7 @@ class LengthScheduleWrapper(Iterator[Dict[str, Any]]):
         self.min_chunks = max(1, min_chunks) # Ensure at least 1 chunk
         self._current_step = 0 # Tracks how many times __next__ has been called
 
-    def __iter__(self) -> Iterator[Dict[str, Any]]:
+    def __iter__(self) -> Iterator[Tuple[List[List[int]], List[int], str]]:
         return self
 
     def _calculate_current_max_chunks(self) -> int:
@@ -46,14 +46,14 @@ class LengthScheduleWrapper(Iterator[Dict[str, Any]]):
         # Ensure we don't go below the minimum or above the final max
         return max(self.min_chunks, min(current_max, self.final_max_chunks))
 
-    def __next__(self) -> Dict[str, Any]:
+    def __next__(self) -> Tuple[List[List[int]], List[int], str]:
         """
         Fetches the next episode and truncates its document chunks according
         to the current curriculum schedule.
         """
         # Get the next full episode from the base iterator
         try:
-            episode_data = next(self.base_iterator)
+            doc_chunks, question_ids, gold_answer = next(self.base_iterator)
         except StopIteration:
             # Re-raise StopIteration if the base iterator is exhausted
             raise StopIteration
@@ -61,31 +61,25 @@ class LengthScheduleWrapper(Iterator[Dict[str, Any]]):
         # Calculate the max chunks allowed for this step
         current_max_chunks = self._calculate_current_max_chunks()
 
-        # Ensure 'document_chunks' exists and is a list
-        if 'document_chunks' in episode_data and isinstance(episode_data['document_chunks'], list):
+        # Check if doc_chunks is a list and handle accordingly
+        if isinstance(doc_chunks, list):
             # Truncate the document chunks
-            original_num_chunks = len(episode_data['document_chunks'])
+            original_num_chunks = len(doc_chunks)
             # We need at least min_chunks, up to current_max_chunks, but no more than available
             effective_max_chunks = min(max(self.min_chunks, current_max_chunks), original_num_chunks)
-            episode_data['document_chunks'] = episode_data['document_chunks'][:effective_max_chunks]
-            # Optionally store metadata about truncation
-            episode_data['original_num_chunks'] = original_num_chunks
-            episode_data['current_max_chunks_limit'] = current_max_chunks # The calculated limit
-            episode_data['effective_num_chunks'] = effective_max_chunks # The actual number used
+            doc_chunks = doc_chunks[:effective_max_chunks]
+            # Log info (optional - you might want to remove these prints in production)
+            if effective_max_chunks < original_num_chunks:
+                print(f"Curriculum: Using {effective_max_chunks}/{original_num_chunks} chunks")
         else:
-             # Handle cases where 'document_chunks' might be missing or not a list
-             print(f"Warning: 'document_chunks' key missing or not a list in episode data. Skipping truncation.")
-             episode_data['original_num_chunks'] = 0
-             episode_data['current_max_chunks_limit'] = current_max_chunks
-             episode_data['effective_num_chunks'] = 0
-
+            # Handle cases where doc_chunks might not be a list
+            print(f"Warning: doc_chunks is not a list. Skipping truncation.")
 
         # Increment the step counter for the next call
-        # This assumes one call to __next__ corresponds to one training step advancement
-        # in the context of the curriculum schedule.
         self._current_step += 1
-
-        return episode_data
+        
+        # Return the possibly truncated data
+        return doc_chunks, question_ids, gold_answer
 
     def step(self, num_steps: int = 1):
         """Manually advance the curriculum step counter if needed outside of __next__ calls."""

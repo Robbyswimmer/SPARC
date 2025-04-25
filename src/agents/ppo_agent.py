@@ -76,19 +76,42 @@ class WandbCallback(BaseCallback):
         train_metrics["global_step"] = self.num_timesteps
         self._wandb.log(train_metrics)
 
-        # 2) now your QA metrics (if this step finished an episode)
+        # 2) Log episode metrics upon termination
+        # Stable Baselines3 provides episode info in `infos` when `dones` is True
         infos = self.locals.get("infos")
-        if infos and "qa_score" in infos[0]:
-            info = infos[0]
-            self._wandb.log({
-                "episode_reward": info.get("episode_reward", 0.0),
-                "em":             info.get("exact_match",    0.0),
-                "f1":             info.get("f1",             0.0),
-                "qa_score":       info.get("qa_score",       0.0),
-                "tokens_used":    info.get("tokens_used",    0),
-                "generation_time":info.get("generation_time",0.0),
-                "global_step":    self.num_timesteps,
-            })
+        dones = self.locals.get("dones")
+
+        if infos is None or dones is None:
+            print("WandbCallback: infos or dones is None, skipping episode logging.")
+            return True # Should not happen, but safety check
+
+        # Iterate through each environment's info and done status
+        for i in range(self.training_env.num_envs):
+            if dones[i]: # Check if THIS environment terminated
+                print(f"--- Env {i} Episode Terminated (Step {self.num_timesteps}) ---") # DEBUG
+                info = infos[i] # Get the info dict for this specific env
+                episode_info = info.get("episode", {}) # Access episode info
+                
+                # Get metrics directly from info dict if they exist
+                qa_score = info.get("qa_score", None)
+                em = info.get("exact_match", None)
+                f1 = info.get("f1", None)
+                tokens_used = info.get("tokens_used", None)
+
+                if qa_score is not None:
+                    log_data = {
+                        "episode_reward": episode_info.get("r", 0.0),
+                        "episode_length": episode_info.get("l", 0), 
+                        "em": em,
+                        "f1": f1,
+                        "qa_score": qa_score,
+                        "tokens_used": tokens_used,
+                        "global_step": self.num_timesteps,
+                    }
+                    log_data = {k: v for k, v in log_data.items() if v is not None}
+                    self._wandb.log(log_data)
+                else:
+                    print(f"DEBUG (Env {i}): No QA metrics found in info dict")
         return True
 
     def _on_training_end(self) -> None:

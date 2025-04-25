@@ -2,7 +2,7 @@
 """NarrativeQA dataset loader."""
 
 import logging
-from typing import Dict, List, Tuple, Iterator, Any
+from typing import List, Tuple, Iterator
 
 from datasets import load_dataset, Dataset
 from transformers import PreTrainedTokenizerFast

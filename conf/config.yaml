@@ -1,7 +1,12 @@
 exp:
   name: sparc_ppo_longctx
 data:
-  datasets: [narrativeqa, hotpotqa]  # Multiple datasets to use
+  datasets: [narrativeqa, hotpotqa, triviaqa, nq_long]  # All available datasets
+  dataset_order: [narrativeqa, hotpotqa, triviaqa, nq_long]  # From easiest to hardest
+  curriculum_enabled: true  # Enable dataset curriculum
+  qa_thresholds: [0.3, 0.4, 0.5]  # QA score thresholds to unlock next dataset
+  curriculum_update_freq: 1000  # Check for curriculum updates every 1000 steps
+  curriculum_window: 100  # Use 100-episode moving average for QA score
   split: train
 env:
   chunk_size: 256
@@ -23,13 +28,15 @@ train:
   n_steps: 1024
   batch_size: 256
   gamma: 0.99
+  seed: 42  # Random seed for training
   gae_lambda: 0.95
   clip_range: 0.2
 wandb:
   project: SPARC
 eval:
-  frequency: 10   # Evaluate every 10k steps
+  frequency: 10000   # Evaluate every 10k steps
   episodes: 20      # Number of episodes to evaluate on
   deterministic: true
   save_path: "./checkpoints/" # Directory to save best model checkpoints
+  seed: 123  # Random seed for evaluation
   name_prefix: "sparc_best_model" # Prefix for the best model filename

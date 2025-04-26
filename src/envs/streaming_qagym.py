@@ -5,7 +5,7 @@ from typing import Iterable, Dict, Any, Tuple, List, Callable
 from transformers import AutoTokenizer
 from utils.llm_interface import LLMInterface
 from utils.model_paths import llama_32_3b
-from utils.metrics import compute_exact_match, compute_f1, compute_qa_score
+from utils.metrics import compute_exact_match, compute_f1, compute_qa_score, max_over_refs, compute_qa_score_multi
 
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -50,7 +50,7 @@ class StreamingQAGym(gym.Env):
                  dataset_name: str = "deepmind/narrativeqa",
                  split: str = "train",
                  max_window: int = _MAX_WINDOW,
-                 data_loader_fn: Callable[[], Iterable[Tuple[List[List[int]], List[int], str]]] = None,
+                 data_loader_fn: Callable[[], Iterable[Tuple[List[List[int]], List[int], List[str]]]] = None,
                  chunk_size: int = _CHUNK_SIZE,
                  token_reward_max: float = 0.1,      # Maximum per-episode token reward
                  token_reward_anneal_steps: int = 50000,  # Steps to anneal token rewards to 10%
@@ -98,7 +98,8 @@ class StreamingQAGym(gym.Env):
         self.doc_chunks = None
         self.stored_tokens = []            # rolling context buffer
         self.question_ids = None
-        self.gold_answer = None
+        self.gold_answer = None            # Primary answer string
+        self.gold_answers = []             # List of reference answers
         self.gold_answer_token_ids = set()  # Will hold tokenized gold answer for heuristic rewards
         self.chunk_idx = 0
         self.steps_left = None             # filled during reset()
@@ -115,9 +116,9 @@ class StreamingQAGym(gym.Env):
                 # Attempt to create iterator if it wasn't created initially
                 self.ds_iter = iter(self.data_loader_fn())
             
-        # Get the next tuple of (doc_chunks, question_ids, gold_answer)
+        # Get the next tuple of (doc_chunks, question_ids, gold_answers)
         try:
-            doc_chunks, question_ids, gold_answer = next(self.ds_iter)  # throws StopIteration when exhausted
+            doc_chunks, question_ids, gold_answers = next(self.ds_iter)  # throws StopIteration when exhausted
         except StopIteration:
             if self.data_loader_fn is None:
                 raise RuntimeError("Cannot reset iterator: Dataset loader function was not provided.")
@@ -126,7 +127,7 @@ class StreamingQAGym(gym.Env):
             print("[StreamingQAGym] Data iterator exhausted. Resetting by calling data_loader_fn.")
             self.ds_iter = iter(self.data_loader_fn()) # Reset the iterator using the loader function
             try:
-                doc_chunks, question_ids, gold_answer = next(self.ds_iter)
+                doc_chunks, question_ids, gold_answers = next(self.ds_iter)
             except StopIteration:
                 # If still no data after reset, the loader function might be returning an empty/exhausted iterator
                 raise RuntimeError("Dataset loader function failed to yield any examples after reset")
@@ -134,9 +135,14 @@ class StreamingQAGym(gym.Env):
         # Store the values directly from the tuple - they're already tokenized and chunked
         self.doc_chunks = doc_chunks
         self.question_ids = question_ids
-        self.gold_answer = gold_answer
         
-        # Tokenize gold answer for heuristic rewards
+        # Store the list of gold answers for max-over-references evaluation
+        self.gold_answers = gold_answers
+        
+        # Use the first answer as the primary answer for backward compatibility
+        self.gold_answer = self.gold_answers[0] if self.gold_answers else ""
+        
+        # Tokenize primary gold answer for heuristic rewards
         gold_answer_tokens = tokenizer(self.gold_answer, add_special_tokens=False).input_ids
         self.gold_answer_token_ids = set(gold_answer_tokens)
         
@@ -228,23 +234,35 @@ class StreamingQAGym(gym.Env):
             prompt_ids = context + self.question_ids
 
             # Query LLM and score
-            model_answer  = self._query_llm(prompt_ids)
-            em      = compute_exact_match(model_answer, self.gold_answer)
-            f1      = compute_f1(model_answer, self.gold_answer)
-            qa_score      = compute_qa_score(model_answer, self.gold_answer)
+            model_answer = self._query_llm(prompt_ids)
+            
+            # Calculate standard metrics against primary answer
+            em = compute_exact_match(model_answer, self.gold_answer)
+            f1 = compute_f1(model_answer, self.gold_answer)
+            
+            # Calculate max-over-references metrics
+            max_em = max_over_refs(compute_exact_match, model_answer, self.gold_answers)
+            max_f1 = max_over_refs(compute_f1, model_answer, self.gold_answers)
+            
+            # Use multi-reference QA score for reward
+            qa_score = compute_qa_score_multi(self.gold_answers, model_answer)
+            
             token_penalty = ALPHA * (len(prompt_ids) / self.max_window)
-            reward        = qa_score - token_penalty
+            reward = qa_score - token_penalty
 
             # Return an “empty” obs and terminate
             obs = np.full(self.chunk_size, tokenizer.pad_token_id, dtype=np.int32)
             info = {
                 "step_idx":     self.chunk_idx,
-                "exact_match":  em,
-                "f1":           f1,
+                "exact_match":  em,  # Single reference (backward compatibility)
+                "f1":           f1,  # Single reference (backward compatibility)
+                "max_em":       max_em,  # Max over all references
+                "max_f1":       max_f1,  # Max over all references
                 "qa_score":     qa_score,
                 "tokens_used":  len(prompt_ids),
                 "model_answer": model_answer,
                 "gold_answer":  self.gold_answer,
+                "gold_answers": self.gold_answers,
             }
             return obs, reward, True, False, info
 

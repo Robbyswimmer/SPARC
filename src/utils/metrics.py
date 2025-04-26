@@ -1,5 +1,5 @@
 import re
-from typing import List
+from typing import List, Callable
 from collections import Counter
 
 def normalize_text(s: str) -> List[str]:
@@ -52,12 +52,44 @@ def compute_f1(gold: str, pred: str) -> float:
     f1 = 2 * precision * recall / (precision + recall)
     return round(f1 * 10000) / 10000  # round for test match
 
+def max_over_refs(metric_fn: Callable[[str, str], float], pred: str, refs: List[str]) -> float:
+    """
+    Compute the maximum score of a metric over multiple reference answers.
+    
+    Args:
+        metric_fn: Function that computes a metric between prediction and reference
+        pred: The predicted answer
+        refs: List of reference (gold) answers
+        
+    Returns:
+        Maximum score across all references
+    """
+    if not refs:
+        return 0.0
+    return max(metric_fn(pred, ref) for ref in refs)
+
 def compute_qa_score(gold: str, pred: str) -> float:
     """
-    Combine EM and F1: weighted sum (e.g., 0.5*EM + 0.5*F1).
+    Combine EM and F1: weighted sum (e.g., 0.5*EM + 0.5*F1) for a single reference.
     """
     em = compute_em(gold, pred)
     f1 = compute_f1(gold, pred)
+    return 0.5 * em + 0.5 * f1
+
+def compute_qa_score_multi(gold_refs: List[str], pred: str) -> float:
+    """
+    Combine max-over-references EM and F1: weighted sum (0.5*EM + 0.5*F1).
+    Uses the maximum score across all reference answers.
+    
+    Args:
+        gold_refs: List of reference (gold) answers
+        pred: The predicted answer
+        
+    Returns:
+        Combined QA score using max-over-references approach
+    """
+    em = max_over_refs(compute_em, pred, gold_refs)
+    f1 = max_over_refs(compute_f1, pred, gold_refs)
     return 0.5 * em + 0.5 * f1
 
 # ================================= TEST CASES =================================

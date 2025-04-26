@@ -5,16 +5,11 @@ This module provides a callback for periodically evaluating the agent's
 performance on a fixed validation set during training.
 """
 from stable_baselines3.common.callbacks import BaseCallback
-from stable_baselines3.common.evaluation import evaluate_policy
 from stable_baselines3.common.vec_env import DummyVecEnv
 import numpy as np
 import wandb
-import warnings
 import os
-from typing import Callable, Dict, Any, Optional, List, Union
-import time
-import gymnasium as gym
-
+from typing import Callable, Any
 from envs.streaming_qagym import StreamingQAGym
 
 class ValidationCallback(BaseCallback):
@@ -106,6 +101,8 @@ class ValidationCallback(BaseCallback):
         qa_scores = []
         em_scores = []
         f1_scores = []
+        max_em_scores = []  # Track max-over-references EM
+        max_f1_scores = []  # Track max-over-references F1
         tokens_used = []
         
         # Run evaluation episodes manually to collect detailed metrics
@@ -158,6 +155,9 @@ class ValidationCallback(BaseCallback):
                 qa_scores.append(episode_info.get("qa_score", 0.0))
                 em_scores.append(episode_info.get("exact_match", 0.0))
                 f1_scores.append(episode_info.get("f1", 0.0))
+                # Get max-over-references metrics if available
+                max_em_scores.append(episode_info.get("max_em", episode_info.get("exact_match", 0.0)))
+                max_f1_scores.append(episode_info.get("max_f1", episode_info.get("f1", 0.0)))
                 tokens_used.append(episode_info.get("tokens_used", 0))
         
         # Calculate summary statistics
@@ -179,6 +179,8 @@ class ValidationCallback(BaseCallback):
                 "eval/mean_qa_score": np.mean(qa_scores),
                 "eval/mean_em": np.mean(em_scores),
                 "eval/mean_f1": np.mean(f1_scores),
+                "eval/mean_max_em": np.mean(max_em_scores),  # Log max-over-references EM
+                "eval/mean_max_f1": np.mean(max_f1_scores),  # Log max-over-references F1
                 "eval/mean_tokens_used": np.mean(tokens_used),
             })
         
@@ -199,7 +201,6 @@ class ValidationCallback(BaseCallback):
         
         # Log to wandb if available
         try:
-            import wandb
             if wandb.run is not None:
                 # Log scalar metrics
                 wandb.log(self.last_metrics)

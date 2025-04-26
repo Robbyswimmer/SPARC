@@ -44,18 +44,21 @@ def chunk_document(token_ids: List[int], chunk_size: int = 256) -> List[List[int
         for i in range(0, len(token_ids), chunk_size)
     ]
 
-# Standard format for QA datasets: (doc_chunks, question_ids, answers)
-# where:
-# - doc_chunks: List[List[int]] - tokenized chunks of the document
-# - question_ids: List[int] - tokenized question
-# - answers: str or List[str] - answer string(s)
+# Standard format for QA datasets: Dictionary with the following keys:
+# {
+#     "doc_chunks": List[List[int]],  # tokenized chunks of the document
+#     "question_ids": List[int],      # tokenized question
+#     "answers": List[str],           # list of answer strings
+#     "meta": Dict[str, Any]          # metadata like dataset name, example ID, etc.
+# }
 
 def narrativeqa_adapter(
     tokenizer: PreTrainedTokenizerFast, 
     split: str = "train", 
     streaming: bool = True,
     use_summaries: bool = True,  # Use summaries instead of full stories for easier training
-) -> Iterator[Tuple[List[List[int]], List[int], List[str]]]:
+    chunk_size: int = 256,
+) -> Iterator[Dict[str, Any]]:
     """Adapter for NarrativeQA dataset."""
     try:
         # Load the dataset - note: the dataset ID is "narrativeqa" not "deepmind/narrativeqa"
@@ -88,14 +91,26 @@ def narrativeqa_adapter(
             question_tokens = tokenizer(question, add_special_tokens=False).input_ids
             
             # Chunk document
-            doc_chunks = chunk_document(doc_tokens)
+            doc_chunks = chunk_document(doc_tokens, chunk_size)
             
             # Skip if document chunks are empty
             if not doc_chunks:
                 logger.warning(f"Skipping sample due to empty document chunks: {item.get('id', 'N/A')}")
                 continue
             
-            yield doc_chunks, question_tokens, answers
+            # Create metadata
+            meta = {
+                "dataset": "narrativeqa",
+                "id": item.get("id", "N/A"),
+                "use_summaries": use_summaries
+            }
+            
+            yield {
+                "doc_chunks": doc_chunks,
+                "question_ids": question_tokens,
+                "answers": answers,
+                "meta": meta
+            }
             
         except Exception as e:
             logger.error(f"Error processing NarrativeQA sample: {e}")
@@ -105,7 +120,8 @@ def hotpotqa_adapter(
     tokenizer: PreTrainedTokenizerFast,
     split: str = "train",
     streaming: bool = True,
-) -> Iterator[Tuple[List[List[int]], List[int], List[str]]]:
+    chunk_size: int = 256,
+) -> Iterator[Dict[str, Any]]:
     """Adapter for HotpotQA dataset."""
     try:
         dataset = load_dataset(
@@ -159,14 +175,26 @@ def hotpotqa_adapter(
             question_tokens = tokenizer(question, add_special_tokens=False).input_ids
             
             # Chunk document
-            doc_chunks = chunk_document(doc_tokens)
+            doc_chunks = chunk_document(doc_tokens, chunk_size)
             
             # Skip if document chunks are empty
             if not doc_chunks:
                 logger.warning(f"Skipping HotpotQA sample due to empty document chunks")
                 continue
             
-            yield doc_chunks, question_tokens, answers
+            # Create metadata with supporting facts if available
+            meta = {
+                "dataset": "hotpotqa",
+                "id": item.get("id", "N/A"),
+                "supporting_facts": item.get("supporting_facts", [])
+            }
+            
+            yield {
+                "doc_chunks": doc_chunks,
+                "question_ids": question_tokens,
+                "answers": answers,
+                "meta": meta
+            }
             
         except Exception as e:
             logger.error(f"Error processing HotpotQA sample: {e}")
@@ -176,7 +204,8 @@ def triviaqa_adapter(
     tokenizer: PreTrainedTokenizerFast,
     split: str = "train",
     streaming: bool = True,
-) -> Iterator[Tuple[List[List[int]], List[int], List[str]]]:
+    chunk_size: int = 256,
+) -> Iterator[Dict[str, Any]]:
     """Adapter for TriviaQA dataset."""
     try:
         dataset = load_dataset("trivia_qa", "rc", split=split, streaming=streaming)
@@ -217,14 +246,26 @@ def triviaqa_adapter(
             question_tokens = tokenizer(question, add_special_tokens=False).input_ids
             
             # Chunk document
-            doc_chunks = chunk_document(doc_tokens)
+            doc_chunks = chunk_document(doc_tokens, chunk_size)
             
             # Skip if document chunks are empty
             if not doc_chunks:
                 logger.warning("Skipping TriviaQA sample due to empty document chunks")
                 continue
             
-            yield doc_chunks, question_tokens, answers
+            # Create metadata
+            meta = {
+                "dataset": "triviaqa",
+                "id": item.get("id", "N/A"),
+                "entity_pages": item.get("entity_pages", [])
+            }
+            
+            yield {
+                "doc_chunks": doc_chunks,
+                "question_ids": question_tokens,
+                "answers": answers,
+                "meta": meta
+            }
             
         except Exception as e:
             logger.error(f"Error processing TriviaQA sample: {e}")
@@ -234,7 +275,8 @@ def nq_adapter(
     tokenizer: PreTrainedTokenizerFast,
     split: str = "train",
     streaming: bool = True,
-) -> Iterator[Tuple[List[List[int]], List[int], List[str]]]:
+    chunk_size: int = 256,
+) -> Iterator[Dict[str, Any]]:
     """Adapter for Natural Questions dataset."""
     try:
         dataset = load_dataset("nq_open", split=split, streaming=streaming)
@@ -274,14 +316,26 @@ def nq_adapter(
             question_tokens = tokenizer(question, add_special_tokens=False).input_ids
             
             # Chunk document
-            doc_chunks = chunk_document(doc_tokens)
+            doc_chunks = chunk_document(doc_tokens, chunk_size)
             
             # Skip if document chunks are empty
             if not doc_chunks:
                 logger.warning("Skipping NQ sample due to empty document chunks")
                 continue
             
-            yield doc_chunks, question_tokens, answers  # Return all answers
+            # Create metadata
+            meta = {
+                "dataset": "nq_long",
+                "id": item.get("id", "N/A"),
+                "synthetic_context": True  # Flag indicating this is synthetic context
+            }
+            
+            yield {
+                "doc_chunks": doc_chunks,
+                "question_ids": question_tokens,
+                "answers": answers,
+                "meta": meta
+            }
             
         except Exception as e:
             logger.error(f"Error processing NQ sample: {e}")
@@ -295,24 +349,47 @@ DATASET_ADAPTERS = {
     "nq_long": nq_adapter,
 }
 
+# Dataset configuration options
+DATASET_CONFIG = {
+    "narrativeqa": {
+        "use_summaries": True,  # Use summaries instead of full stories by default
+    }
+}
+
 # ================= Mixed Dataset Streaming =================
 
-def get_dataset_iterator(dataset_name: str, tokenizer: PreTrainedTokenizerFast, split: str = "train") -> Iterator:
-    """Get iterator for a specific dataset using its adapter."""
+def get_dataset_iterator(dataset_name: str, tokenizer: PreTrainedTokenizerFast, split: str = "train", chunk_size: int = 256) -> Iterator:
+    """Get iterator for a specific dataset using its adapter.
+    
+    Args:
+        dataset_name: Name of the dataset to load
+        tokenizer: Tokenizer for processing text
+        split: Dataset split to use
+        chunk_size: Size of document chunks
+        
+    Returns:
+        Iterator yielding dataset examples in standardized dictionary format
+    """
     adapter = DATASET_ADAPTERS.get(dataset_name)
     if not adapter:
         raise ValueError(f"No adapter available for dataset: {dataset_name}")
     
+    # Get dataset-specific config options
+    config = DATASET_CONFIG.get(dataset_name, {})
+    
     # Call the adapter with appropriate parameters
     if dataset_name == "narrativeqa":
-        return adapter(tokenizer, split=split, use_summaries=True)
+        # Use config option for use_summaries with default fallback
+        use_summaries = config.get("use_summaries", True)
+        return adapter(tokenizer, split=split, use_summaries=use_summaries, chunk_size=chunk_size)
     else:
-        return adapter(tokenizer, split=split)
+        return adapter(tokenizer, split=split, chunk_size=chunk_size)
 
 def mixed_stream(dataset_names: List[str], 
                  tokenizer: PreTrainedTokenizerFast, 
-                 split: str = "train", 
-                 seed: Optional[int] = None) -> Iterator[Tuple[List[List[int]], List[int], List[str]]]:
+                 split: str = "train",
+                 chunk_size: int = 256,
+                 seed: Optional[int] = None) -> Iterator[Dict[str, Any]]:
     """Stream a mix of datasets with uniform random sampling.
     
     Args:
@@ -335,7 +412,7 @@ def mixed_stream(dataset_names: List[str],
     dataset_errors = {}
     for name in dataset_names:
         try:
-            iterators[name] = get_dataset_iterator(name, tokenizer, split)
+            iterators[name] = get_dataset_iterator(name, tokenizer, split, chunk_size)
         except Exception as e:
             error_msg = str(e)
             dataset_errors[name] = error_msg
@@ -347,7 +424,7 @@ def mixed_stream(dataset_names: List[str],
         logger.warning("Falling back to synthetic dataset to allow training to continue")
         
         # Create a synthetic fallback iterator
-        iterators["synthetic_fallback"] = _create_synthetic_fallback(tokenizer, seed)
+        iterators["synthetic_fallback"] = _create_synthetic_fallback(tokenizer, seed, chunk_size)
     
     while True:
         # Randomly select a dataset
@@ -360,7 +437,7 @@ def mixed_stream(dataset_names: List[str],
             # Reinitialize the iterator if it's exhausted
             logger.info(f"Reinitializing iterator for {dataset_name}")
             try:
-                iterators[dataset_name] = get_dataset_iterator(dataset_name, tokenizer, split)
+                iterators[dataset_name] = get_dataset_iterator(dataset_name, tokenizer, split, chunk_size)
                 yield next(iterators[dataset_name])
             except Exception as e:
                 error_msg = str(e)
@@ -371,11 +448,11 @@ def mixed_stream(dataset_names: List[str],
                 # If all iterators have failed, create a synthetic fallback
                 if not iterators:
                     logger.error("All dataset iterators failed, falling back to synthetic dataset")
-                    iterators["synthetic_fallback"] = _create_synthetic_fallback(tokenizer, seed)
+                    iterators["synthetic_fallback"] = _create_synthetic_fallback(tokenizer, seed, chunk_size)
 
 # ================= Synthetic Fallback Dataset =================
 
-def _create_synthetic_fallback(tokenizer: PreTrainedTokenizerFast, seed: Optional[int] = None) -> Iterator[Tuple[List[List[int]], List[int], List[str]]]:
+def _create_synthetic_fallback(tokenizer: PreTrainedTokenizerFast, seed: Optional[int] = None, chunk_size: int = 256) -> Iterator[Dict[str, Any]]:
     """Create a synthetic fallback dataset for when all real datasets fail.
     
     This function generates simple QA pairs with predictable answers to allow
@@ -459,9 +536,21 @@ def _create_synthetic_fallback(tokenizer: PreTrainedTokenizerFast, seed: Optiona
         question_tokens = tokenizer(question_template, add_special_tokens=False).input_ids
         
         # Chunk document
-        doc_chunks = chunk_document(doc_tokens)
+        doc_chunks = chunk_document(doc_tokens, chunk_size)
         
-        yield doc_chunks, question_tokens, answers
+        # Create metadata
+        meta = {
+            "dataset": "synthetic_fallback",
+            "id": f"synthetic_{rng.integers(0, 10000)}",
+            "synthetic": True
+        }
+        
+        yield {
+            "doc_chunks": doc_chunks,
+            "question_ids": question_tokens,
+            "answers": answers,
+            "meta": meta
+        }
 
 # ================= Curriculum Learning =================
 
@@ -484,7 +573,9 @@ class CurriculumDataLoader:
                  qa_thresholds: List[float] = [0.3, 0.4, 0.5],  # Thresholds to unlock next dataset
                  split: str = "train",
                  seed: Optional[int] = None,
-                 regress_ok: bool = True):
+                 regress_ok: bool = True,
+                 chunk_size: int = 256,
+                 dataset_config: Dict[str, Dict[str, Any]] = None):
         """Initialize curriculum data loader.
         
         Args:
@@ -496,6 +587,10 @@ class CurriculumDataLoader:
             regress_ok: If True (default), keeps harder datasets in the mix even if
                         performance drops below the threshold that added them.
                         If False, removes datasets when performance drops below threshold.
+            chunk_size: Size of document chunks
+            dataset_config: Optional configuration for specific datasets, e.g.,
+                           {"narrativeqa": {"use_summaries": False}} to use full stories
+                           instead of summaries for NarrativeQA
         """
         self.tokenizer = tokenizer
         self.dataset_order = dataset_order
@@ -503,6 +598,15 @@ class CurriculumDataLoader:
         self.split = split
         self.seed = seed
         self.regress_ok = regress_ok
+        self.chunk_size = chunk_size
+        
+        # Update global dataset config with user-provided overrides
+        if dataset_config:
+            for dataset_name, config in dataset_config.items():
+                if dataset_name in DATASET_CONFIG:
+                    DATASET_CONFIG[dataset_name].update(config)
+                else:
+                    DATASET_CONFIG[dataset_name] = config
         
         # Start with just the first (easiest) dataset
         self.active_datasets = [dataset_order[0]]
@@ -513,7 +617,13 @@ class CurriculumDataLoader:
     
     def _create_iterator(self) -> Iterator:
         """Create a mixed stream iterator with current active datasets."""
-        return mixed_stream(self.active_datasets, self.tokenizer, self.split, self.seed)
+        return mixed_stream(
+            self.active_datasets, 
+            self.tokenizer, 
+            self.split, 
+            chunk_size=self.chunk_size,
+            seed=self.seed
+        )
     
     def update_curriculum(self, qa_score: float) -> bool:
         """Update the curriculum based on current QA score.

@@ -50,7 +50,7 @@ class StreamingQAGym(gym.Env):
                  dataset_name: str = "deepmind/narrativeqa",
                  split: str = "train",
                  max_window: int = _MAX_WINDOW,
-                 data_loader_fn: Callable[[], Iterable[Tuple[List[List[int]], List[int], List[str]]]] = None,
+                 data_loader_fn: Callable[[], Iterable[Dict[str, Any]]] = None,
                  chunk_size: int = _CHUNK_SIZE,
                  token_reward_max: float = 0.1,      # Maximum per-episode token reward
                  token_reward_anneal_steps: int = 50000,  # Steps to anneal token rewards to 10%
@@ -116,9 +116,9 @@ class StreamingQAGym(gym.Env):
                 # Attempt to create iterator if it wasn't created initially
                 self.ds_iter = iter(self.data_loader_fn())
             
-        # Get the next tuple of (doc_chunks, question_ids, gold_answers)
+        # Get the next example (dictionary format)
         try:
-            doc_chunks, question_ids, gold_answers = next(self.ds_iter)  # throws StopIteration when exhausted
+            example = next(self.ds_iter)  # throws StopIteration when exhausted
         except StopIteration:
             if self.data_loader_fn is None:
                 raise RuntimeError("Cannot reset iterator: Dataset loader function was not provided.")
@@ -127,17 +127,16 @@ class StreamingQAGym(gym.Env):
             print("[StreamingQAGym] Data iterator exhausted. Resetting by calling data_loader_fn.")
             self.ds_iter = iter(self.data_loader_fn()) # Reset the iterator using the loader function
             try:
-                doc_chunks, question_ids, gold_answers = next(self.ds_iter)
+                example = next(self.ds_iter)
             except StopIteration:
                 # If still no data after reset, the loader function might be returning an empty/exhausted iterator
                 raise RuntimeError("Dataset loader function failed to yield any examples after reset")
             
-        # Store the values directly from the tuple - they're already tokenized and chunked
-        self.doc_chunks = doc_chunks
-        self.question_ids = question_ids
-        
-        # Store the list of gold answers for max-over-references evaluation
-        self.gold_answers = gold_answers
+        # Extract and store values from the dictionary
+        self.doc_chunks = example["doc_chunks"]
+        self.question_ids = example["question_ids"]
+        self.gold_answers = example["answers"]
+        self.example_meta = example.get("meta", {})  # Store metadata for logging
         
         # Use the first answer as the primary answer for backward compatibility
         self.gold_answer = self.gold_answers[0] if self.gold_answers else ""

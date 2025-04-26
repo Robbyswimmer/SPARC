@@ -8,6 +8,10 @@ data:
   curriculum_update_freq: 1000  # Check for curriculum updates every 1000 steps
   curriculum_window: 100  # Use 100-episode moving average for QA score
   split: train
+  dataset_config:  # Dataset-specific configuration
+    narrativeqa:
+      use_summaries: true  # Use summaries instead of full stories for NarrativeQA
+    # Add other dataset-specific configurations as needed
 env:
   chunk_size: 256
   max_window: 2048

@@ -84,7 +84,9 @@ def main(cfg: DictConfig):
             dataset_order=dataset_order,
             qa_thresholds=qa_thresholds,
             split=cfg.data.split,
-            seed=cfg.train.seed
+            seed=cfg.train.seed,
+            chunk_size=cfg.env.chunk_size,
+            dataset_config=cfg.data.get('dataset_config', None)
         )
         
         # Get the iterator directly - not a function that returns an iterator
@@ -100,6 +102,7 @@ def main(cfg: DictConfig):
                 dataset_names=cfg.data.datasets,
                 tokenizer=tokenizer,
                 split=cfg.data.split,
+                chunk_size=cfg.env.chunk_size,
                 seed=cfg.train.seed
             )
     
@@ -112,7 +115,12 @@ def main(cfg: DictConfig):
         for name in cfg.data.datasets:
             try:
                 # Use first 50 samples per dataset for validation
-                iterator = get_dataset_iterator(name, tokenizer, split="validation")
+                iterator = get_dataset_iterator(
+                    name, 
+                    tokenizer, 
+                    split="validation",
+                    chunk_size=cfg.env.chunk_size
+                )
                 datasets.append(iterator)
             except Exception as e:
                 logger.warning(f"Failed to load validation data for {name}: {e}")

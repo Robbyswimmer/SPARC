@@ -13,6 +13,11 @@ data:
 env:
   chunk_size: 256
   max_window: 2048
+  reward:
+    alpha: 1.0            # Weight for QA score
+    beta_keep: -0.01    # Cost per token KEPT in context window
+    beta_compress: -0.05 # Cost per token in COMPRESSED chunk (if applicable)
+    gamma_step: -0.01   # Flat cost applied per step, regardless of action
 curriculum:
   enabled: true
   start_chunks: 2
@@ -26,7 +31,7 @@ model:
 train:
   n_envs: 8
   total_steps: 1_000_000
-  lr: 5e-5
+  lr: 3e-5
   n_steps: 1024
   batch_size: 256
   gamma: 0.99

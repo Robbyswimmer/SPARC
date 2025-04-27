@@ -237,6 +237,7 @@ def main(cfg: DictConfig):
                 chunk_size   = cfg.env.chunk_size,
                 max_window   = cfg.env.max_window,
                 data_loader_fn = state_refs['train_data_fn'],
+                gamma_step = cfg.env.get('gamma_step', 0.0), # Load gamma_step from config
                 seed         = seed,
             )
             # If using wrapped loader_fn approach for dataset+chunk curriculum, 

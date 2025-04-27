@@ -1,12 +1,10 @@
 # src/train.py
-import hydra, wandb, torch, gymnasium as gym
-from omegaconf import DictConfig, OmegaConf
+import hydra, wandb
+from omegaconf import DictConfig
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor
 from stable_baselines3.common.callbacks import BaseCallback
 from transformers import AutoTokenizer
-import itertools
-from typing import Optional, Dict, List, Any
 
 from envs.streaming_qagym import StreamingQAGym
 from agents.ppo_agent import TokenEmbedExtractor, WandbCallback
@@ -112,6 +110,9 @@ def main(cfg: DictConfig):
         logger.info("Creating validation data iterator")
         # For validation, use a mix of validation data from all datasets
         datasets = []
+        valid_dataset_names = []
+        
+        # First try to load each dataset and track which ones succeed
         for name in cfg.data.datasets:
             try:
                 # Use first 50 samples per dataset for validation
@@ -121,16 +122,37 @@ def main(cfg: DictConfig):
                     split="validation",
                     chunk_size=cfg.env.chunk_size
                 )
-                datasets.append(iterator)
+                # Test the iterator by getting one item
+                try:
+                    next(iterator)
+                    # If we get here, the iterator works
+                    datasets.append(iterator)
+                    valid_dataset_names.append(name)
+                    logger.info(f"Successfully loaded validation data for {name}")
+                except Exception as e:
+                    logger.warning(f"Failed to iterate validation data for {name}: {e}")
             except Exception as e:
                 logger.warning(f"Failed to load validation data for {name}: {e}")
         
         if not datasets:
-            raise ValueError("No validation datasets could be loaded")
+            # Fallback to using just NarrativeQA for validation if nothing else works
+            logger.warning("No validation datasets could be loaded, falling back to NarrativeQA training data")
+            try:
+                iterator = get_dataset_iterator(
+                    "narrativeqa", 
+                    tokenizer, 
+                    split="train",  # Use training data as fallback
+                    chunk_size=cfg.env.chunk_size
+                )
+                datasets.append(iterator)
+                valid_dataset_names.append("narrativeqa")
+            except Exception as e:
+                raise ValueError(f"Failed to load fallback validation data: {e}")
             
-        # Create a mixed stream for validation
+        # Create a mixed stream for validation using only the datasets that work
+        logger.info(f"Using datasets for validation: {valid_dataset_names}")
         return mixed_stream(
-            dataset_names=cfg.data.datasets,
+            dataset_names=valid_dataset_names,  # Only use datasets that successfully loaded
             tokenizer=tokenizer,
             split="validation",
             seed=cfg.eval.seed
@@ -202,12 +224,16 @@ def main(cfg: DictConfig):
             )
             # If using wrapped loader_fn approach for dataset+chunk curriculum, 
             # store reference to the wrapper for the callback
-            if dataset_enabled and cfg.curriculum.enabled and state_refs['chunk_curriculum_wrapper'] is True:
-                # Find the wrapper inside the environment's data loader
-                for item in env.ds_iter.__self__.__dict__.values():
-                    if isinstance(item, LengthScheduleWrapper):
-                        state_refs['chunk_curriculum_wrapper'] = item
-                        break
+            if dataset_enabled and cfg.curriculum.enabled:
+                # Check if the data iterator is already a LengthScheduleWrapper
+                if isinstance(env.ds_iter, LengthScheduleWrapper):
+                    state_refs['chunk_curriculum_wrapper'] = env.ds_iter
+                # Or check if it might be inside the iterator's __self__ attribute
+                elif hasattr(env.ds_iter, '__self__') and hasattr(env.ds_iter.__self__, '__dict__'):
+                    for item in env.ds_iter.__self__.__dict__.values():
+                        if isinstance(item, LengthScheduleWrapper):
+                            state_refs['chunk_curriculum_wrapper'] = item
+                            break
             return env
         return _thunk
 
@@ -249,6 +275,20 @@ def main(cfg: DictConfig):
         callbacks.append(chunk_callback)
         logger.info("Using chunk length curriculum progression callback")
     
+    # Add validation callback for performance tracking on held-out data
+    # Create this before dataset curriculum callback since it depends on it
+    validation_callback = ValidationCallback(
+        eval_freq=cfg.eval.frequency,      # How often to evaluate
+        eval_episodes=cfg.eval.episodes,   # Number of validation episodes
+        data_loader_fn=get_validation_data,  # Validation data loader function
+        n_eval_envs=1,                     # Single environment for validation
+        save_path=cfg.eval.save_path,      # Path to save best model
+        name_prefix=cfg.eval.name_prefix,  # Prefix for best model file
+        verbose=1
+    )
+    callbacks.append(validation_callback)
+    print("Using validation callback for performance tracking and checkpointing")
+    
     # Add dataset curriculum callback if enabled
     if dataset_enabled:
         
@@ -284,15 +324,16 @@ def main(cfg: DictConfig):
             return updated
             
         # Create and add the callback with our custom update function
+        # Note: We pass the validation_callback to use its metrics instead of on-policy rollouts
         dataset_callback = CurriculumCallback(
             curriculum_loader=curriculum_loader,
-            eval_freq=cfg.data.get('curriculum_update_freq', 1000),
-            moving_avg_window=cfg.data.get('curriculum_window', 100),
+            validation_callback=validation_callback,  # Use validation metrics for curriculum decisions
+            eval_freq=cfg.eval.frequency,  # Check after each validation run
             verbose=1,
             update_fn=update_dataset_curriculum
         )
         callbacks.append(dataset_callback)
-        logger.info("Using dataset curriculum progression callback")
+        print("Using dataset curriculum progression callback with validation metrics")
     
     # Add entropy schedule callback to linearly decay entropy coefficient
     entropy_callback = EntropyScheduleCallback(
@@ -310,18 +351,7 @@ def main(cfg: DictConfig):
     callbacks.append(global_step_callback)
     print("Using global step tracking for token reward annealing")
     
-    # Add validation callback for performance tracking on held-out data
-    validation_callback = ValidationCallback(
-        eval_freq=cfg.eval.frequency,      # How often to evaluate
-        eval_episodes=cfg.eval.episodes,   # Number of validation episodes
-        data_loader_fn=get_validation_data,  # Validation data loader function
-        n_eval_envs=1,                     # Single environment for validation
-        save_path=cfg.eval.save_path,      # Path to save best model
-        name_prefix=cfg.eval.name_prefix,  # Prefix for best model file
-        verbose=1
-    )
-    callbacks.append(validation_callback)
-    print("Using validation callback for performance tracking and checkpointing")
+
 
     model.learn(
         total_timesteps = cfg.train.total_steps,

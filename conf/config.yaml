@@ -5,8 +5,6 @@ data:
   dataset_order: [narrativeqa, hotpotqa, triviaqa, nq_long]  # From easiest to hardest
   curriculum_enabled: true  # Enable dataset curriculum
   qa_thresholds: [0.3, 0.4, 0.5]  # QA score thresholds to unlock next dataset
-  curriculum_update_freq: 1000  # Check for curriculum updates every 1000 steps
-  curriculum_window: 100  # Use 100-episode moving average for QA score
   split: train
   dataset_config:  # Dataset-specific configuration
     narrativeqa:
@@ -28,7 +26,7 @@ model:
 train:
   n_envs: 8
   total_steps: 1_000_000
-  lr: 3e-5
+  lr: 5e-5
   n_steps: 1024
   batch_size: 256
   gamma: 0.99

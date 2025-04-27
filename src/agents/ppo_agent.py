@@ -16,8 +16,6 @@ Requirements: stable-baselines3==2.3, wandb, gymnasium>=0.29, torch>=2.1
 from __future__ import annotations
 
 import os
-import argparse
-import datetime as dt
 from typing import Dict, Any
 
 import gymnasium as gym
@@ -28,7 +26,6 @@ from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 import torch as th
 import torch.nn as nn
 import wandb
-import numpy as np
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

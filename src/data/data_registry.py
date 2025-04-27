@@ -5,8 +5,8 @@ with support for curriculum learning based on agent performance.
 """
 
 import numpy as np
-from typing import List, Dict, Any, Optional, Tuple, Iterator, Callable, Union
-from datasets import load_dataset, Dataset
+from typing import List, Dict, Any, Optional, Iterator, Callable
+from datasets import load_dataset
 from transformers import PreTrainedTokenizerFast
 import logging
 
@@ -250,53 +250,143 @@ def triviaqa_adapter(
     streaming: bool = True,
     chunk_size: int = 256,
 ) -> Iterator[Dict[str, Any]]:
-    """Adapter for TriviaQA dataset."""
+    """Adapter for TriviaQA dataset.
+    
+    Args:
+        tokenizer: Tokenizer for processing text
+        split: Dataset split to use
+        streaming: Whether to stream the dataset
+    """
+    # We need better debugging for validation data structure
+    debug_count = 0
+    debug_max = 3  # Number of validation samples to print for debugging
+        
     if split == "validation":
         logger.info(f"Attempting to load TriviaQA validation split...")
+    
     try:
-        # Note: TriviaQA might require specific handling for validation split names
-        # Standard splits might be 'train', 'validation', 'test'. Let's assume 'validation' works for now.
-        dataset = load_dataset("trivia_qa", "rc", split=split, streaming=streaming)
-        logger.info(f"Successfully loaded TriviaQA dataset, split: {split}")
+        # For TriviaQA, we need to use the right split name
+        # For validation, try 'validation' first, then fallback to 'dev' if needed
+        actual_split = split
         if split == "validation":
-            logger.info(f"Successfully loaded TriviaQA validation split.")
+            try:
+                dataset = load_dataset("trivia_qa", "rc", split="validation", streaming=streaming)
+                logger.info(f"Successfully loaded TriviaQA validation split.")
+            except Exception:
+                logger.warning(f"'validation' split not found for TriviaQA, trying 'dev' instead...")
+                try:
+                    dataset = load_dataset("trivia_qa", "rc", split="dev", streaming=streaming)
+                    logger.info(f"Successfully loaded TriviaQA 'dev' split.")
+                    actual_split = "dev"
+                except Exception as e:
+                    logger.error(f"Failed to load TriviaQA validation data with either 'validation' or 'dev' splits: {e}")
+                    return
+        else:
+            dataset = load_dataset("trivia_qa", "rc", split=split, streaming=streaming)
+            logger.info(f"Successfully loaded TriviaQA dataset, split: {split}")
     except Exception as e:
         logger.error(f"Error loading TriviaQA (split={split}): {e}")
-        # Let's check if the error message suggests an invalid split name
-        if "invalid split" in str(e).lower():
-            logger.warning(f"TriviaQA validation split might be named differently. Common names: 'validation', 'dev'. Check HF dataset card.")
         return
     
-    printed_item_debug = False # Flag to print item only once
+    # Process dataset items
     for item in dataset:
-        if split == "validation" and not printed_item_debug: # Log for the FIRST validation item
-            logger.debug(f"Processing FIRST TriviaQA validation item: {item.get('question_id', 'N/A')}")
-            logger.debug(f"Raw TriviaQA validation item structure (first item): {item}")
-            logger.debug(f"Item keys: {list(item.keys())}")
-            printed_item_debug = True # Ensure it only prints once
+        # Print detailed debug info for the first few validation items
+        if split == "validation" and debug_count < debug_max:
+            logger.info(f"------- TriviaQA Validation Item {debug_count+1}/{debug_max} -------")
+            logger.info(f"Item ID: {item.get('question_id', 'N/A')}")
+            logger.info(f"Item keys: {sorted(list(item.keys()))}")
+            
+            # Print selected important fields
+            for key in ['question', 'answer', 'search_results', 'entity_pages', 'evidence', 'aliases']:
+                if key in item:
+                    value = item[key]
+                    if isinstance(value, list) and len(value) > 0:
+                        logger.info(f"{key} (first element): {value[0]}")
+                        if isinstance(value[0], dict) and len(value[0]) > 0:
+                            logger.info(f"{key}[0] keys: {sorted(list(value[0].keys()))}")
+                    else:
+                        logger.info(f"{key}: {value}")
+                else:
+                    logger.info(f"{key}: <not found>")
+            debug_count += 1
         try:
-            search_results = item.get("search_results")
-            # --- Fallback logic ---
+            # Extract context based on document structure, with multiple fallback paths
             context_source = None
+            evidence_found = False
+            context_paths = []
+            
+            # Try search_results path first (common in training data)
+            search_results = item.get("search_results")
             if search_results and isinstance(search_results, list) and len(search_results) > 0:
-                 first_result = search_results[0]
-                 if isinstance(first_result, dict):
-                     context_source = first_result.get("search_context")
-                 else:
-                      logger.warning(f"Skipping TriviaQA sample {item.get('question_id', 'N/A')} with malformed search result (not a dict)")
-                      continue
-
-            # If search_results didn't yield context, try other fields based on debug output (TBD)
+                first_result = search_results[0]
+                if isinstance(first_result, dict) and "search_context" in first_result:
+                    context_source = first_result.get("search_context")
+                    context_paths.append("search_results[0].search_context")
+            
+            # Try evidence path (common in validation data)
+            evidence = item.get("evidence")
+            if not context_source and evidence and isinstance(evidence, list) and len(evidence) > 0:
+                if isinstance(evidence[0], str):
+                    # If evidence is a list of strings, combine the first few
+                    evidence_texts = evidence[:3]  # Limit to first 3 pieces
+                    context_source = " ".join(evidence_texts)
+                    context_paths.append("evidence (strings)")
+                    evidence_found = True
+                elif isinstance(evidence[0], dict):
+                    # If evidence is a list of dicts, look for text fields
+                    for key in ["text", "content", "passage", "context"]:
+                        if key in evidence[0]:
+                            context_source = evidence[0][key]
+                            context_paths.append(f"evidence[0].{key}")
+                            evidence_found = True
+                            break
+            
+            # Try entity_pages path
+            if not context_source and not evidence_found:
+                entity_pages = item.get("entity_pages")
+                if entity_pages and isinstance(entity_pages, list) and len(entity_pages) > 0:
+                    if isinstance(entity_pages[0], str):
+                        context_source = entity_pages[0]
+                        context_paths.append("entity_pages[0] (string)")
+                    elif isinstance(entity_pages[0], dict):
+                        # Try various possible field names
+                        for key in ["text", "content", "page_content", "wiki_context"]:
+                            if key in entity_pages[0]:
+                                context_source = entity_pages[0][key]
+                                context_paths.append(f"entity_pages[0].{key}")
+                                break
+            
+            # Try wiki_context or normal context fields
             if not context_source:
-                 # Placeholder: Add checks here once we know the structure
-                 # e.g., entity_pages = item.get("entity_pages") ... etc.
-                 pass # No fallback implemented yet
-
+                for key in ["wiki_context", "context", "text", "content"]:
+                    if key in item and item[key]:
+                        context_source = item[key]
+                        context_paths.append(key)
+                        break
+            
+            # Try aliases[0] as last resort (if present)
+            if not context_source and item.get("aliases") and len(item["aliases"]) > 0:
+                context_source = f"Question about: {item['aliases'][0]}"
+                context_paths.append("aliases[0]")
+            
+            # Last resort - minimal context with just the question
             if not context_source:
-                logger.warning(f"Skipping TriviaQA sample {item.get('question_id', 'N/A')} with no usable context source found.")
-                continue
-            # --- End Fallback ---
-
+                if split == "validation":
+                    # For validation, use the question itself as minimal context
+                    question = item.get("question", "Unknown question")
+                    context_source = f"Question: {question}"
+                    context_paths.append("question (fallback)")
+                    # Log this case
+                    logger.info(f"Using question as minimal context for TriviaQA sample {item.get('question_id', 'N/A')}")
+                else:
+                    # For training, we can be more selective
+                    logger.warning(f"Skipping TriviaQA sample {item.get('question_id', 'N/A')} with no usable context source found.")
+                    continue
+                    
+            # Log which path we ended up using for debugging
+            if split == "validation" and debug_count <= debug_max:
+                logger.info(f"Context source path(s): {context_paths}")
+                    
             context = context_source # Use the context we found
 
             question = item.get("question")
@@ -430,6 +520,9 @@ DATASET_ADAPTERS = {
 DATASET_CONFIG = {
     "narrativeqa": {
         "use_summaries": True,  # Use summaries instead of full stories by default
+    },
+    "triviaqa": {
+        "skip_validation": False  # Option to skip TriviaQA validation data if it causes issues
     }
 }
 
@@ -442,7 +535,6 @@ def get_dataset_iterator(dataset_name: str, tokenizer: PreTrainedTokenizerFast, 
         dataset_name: Name of the dataset to load
         tokenizer: Tokenizer for processing text
         split: Dataset split to use
-        chunk_size: Size of document chunks
         
     Returns:
         Iterator yielding dataset examples in standardized dictionary format

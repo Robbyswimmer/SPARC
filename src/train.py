@@ -114,13 +114,30 @@ def main(cfg: DictConfig):
         
         # First try to load each dataset and track which ones succeed
         for name in cfg.data.datasets:
+            # Get dataset-specific config if available
+            dataset_config = {}
+            
+            # Apply dataset-specific configurations from the config file
+            if hasattr(cfg.data, 'dataset_config') and hasattr(cfg.data.dataset_config, name):
+                dataset_config = getattr(cfg.data.dataset_config, name)
+                logger.info(f"Using custom config for {name}: {dataset_config}")
+            
+            # Special case for TriviaQA - if it keeps failing, allow skipping it
+            if name == "triviaqa":
+                # Get skip_validation setting, defaulting to False
+                skip_validation = dataset_config.get('skip_validation', False) 
+                if skip_validation:
+                    logger.info(f"Skipping validation data for TriviaQA as configured")
+                    continue
+                
             try:
                 # Use first 50 samples per dataset for validation
                 iterator = get_dataset_iterator(
                     name, 
                     tokenizer, 
                     split="validation",
-                    chunk_size=cfg.env.chunk_size
+                    chunk_size=cfg.env.chunk_size,
+                    **dataset_config  # Pass dataset-specific configs
                 )
                 # Test the iterator by getting one item
                 try:

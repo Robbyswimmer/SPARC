@@ -54,6 +54,7 @@ class LLMInterface:
             n_ctx=n_ctx,
             n_threads=n_threads,
             seed=42,
+            verbose=False,
         )
         
         # Use tokenizer's special tokens

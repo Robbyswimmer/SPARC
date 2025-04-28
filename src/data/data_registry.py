@@ -5,8 +5,8 @@ with support for curriculum learning based on agent performance.
 """
 
 import numpy as np
-from typing import List, Dict, Any, Optional, Tuple, Iterator, Callable, Union
-from datasets import load_dataset, Dataset
+from typing import List, Dict, Any, Optional, Iterator, Callable
+from datasets import load_dataset
 from transformers import PreTrainedTokenizerFast
 import logging
 
@@ -123,6 +123,8 @@ def hotpotqa_adapter(
     chunk_size: int = 256,
 ) -> Iterator[Dict[str, Any]]:
     """Adapter for HotpotQA dataset."""
+    if split == "validation":
+        logger.info(f"Attempting to load HotpotQA validation split...")
     try:
         dataset = load_dataset(
             "hotpot_qa", 
@@ -132,72 +134,114 @@ def hotpotqa_adapter(
             trust_remote_code=True
         )
         logger.info(f"Successfully loaded HotpotQA dataset, split: {split}")
+        if split == "validation":
+            logger.info(f"Successfully loaded HotpotQA validation split.")
     except Exception as e:
-        logger.error(f"Error loading HotpotQA: {e}")
+        logger.error(f"Error loading HotpotQA (split={split}): {e}")
         return
     
+    printed_context_debug = False # Flag to print context only once
     for item in dataset:
+        if split == "validation":
+             logger.debug(f"Processing HotpotQA validation item: {item.get('id', 'N/A')}")
         try:
             # Check if context exists and is not empty
-            if not item["context"] or len(item["context"]) == 0:
-                logger.warning("Skipping HotpotQA sample with empty context")
+            raw_context = item.get("context") # Get raw context first
+            if not raw_context:
+                logger.warning(f"Skipping HotpotQA sample {item.get('id', 'N/A')} with empty or missing context")
                 continue
-                
-            # Check if at least one context item has sentences
-            has_valid_sentences = False
-            for _, sentences in item["context"]:
-                if sentences:  # Check if sentences list is not empty
-                    has_valid_sentences = True
-                    break
-                    
-            if not has_valid_sentences:
-                logger.warning("Skipping HotpotQA sample with no sentences in context")
-                continue
-                
+
+            # --- Debugging: Print raw context structure for validation ---
+            if split == "validation" and not printed_context_debug:
+                 logger.debug(f"Raw HotpotQA validation context structure for item {item.get('id', 'N/A')}: {raw_context}")
+                 # Check type and keys if it's a dict
+                 if isinstance(raw_context, dict):
+                     logger.debug(f"Context keys: {list(raw_context.keys())}")
+                 printed_context_debug = True # Only print for the first item encountered
+            # --- End Debugging ---
+
+            # --- Attempt to extract paragraphs/sentences ---
+            context_list = []
+            if isinstance(raw_context, dict):
+                 # Try extracting 'paragraphs' first
+                 context_list = raw_context.get("paragraphs", [])
+                 # If 'paragraphs' is empty or not found, try 'sentences' directly
+                 if not context_list:
+                      context_list = raw_context.get("sentences", [])
+            elif isinstance(raw_context, list): # Handle if context is just a list
+                 context_list = raw_context
+
+
+            if not isinstance(context_list, list) or not context_list: # Check if it's a non-empty list now
+                 logger.warning(f"Skipping HotpotQA sample {item.get('id', 'N/A')} due to empty or non-list context data after extraction attempts.")
+                 continue
+
+            # --- Build context string safely ---
             context = ""
-            # Concatenate supporting facts
-            for title, sentences in item["context"]:
-                context += f"Title: {title}\n"
-                for sent in sentences:
-                    context += f"{sent}\n"
-            
+            # Assuming context_list now contains the actual text paragraphs/sentences
+            # We might need to refine this based on the debug output
+            titles = raw_context.get("title", []) if isinstance(raw_context, dict) else []
+
+            # If titles exist and match the length of paragraphs/sentences list
+            if titles and len(titles) == len(context_list):
+                 for title, sentences in zip(titles, context_list):
+                      if isinstance(sentences, list) and sentences:
+                          context += f"Title: {title}\n"
+                          for sent in sentences:
+                              context += f"{sent}\n"
+                      elif isinstance(sentences, str): # Handle if elements are strings directly
+                           context += f"Title: {title}\n{sentences}\n"
+            else:
+                 # Fallback: Concatenate all strings found in the list
+                 for element in context_list:
+                      if isinstance(element, list): # If nested list of sentences
+                          for sent in element:
+                              if isinstance(sent, str):
+                                  context += f"{sent}\n"
+                      elif isinstance(element, str): # If just a list of strings
+                          context += f"{element}\n"
+
+            # ... (rest of the adapter: check context, question, answer, tokenize, chunk, yield) ...
+            if not context: # Check if context string ended up empty
+                 logger.warning(f"Skipping HotpotQA sample {item.get('id', 'N/A')} because context string is empty after processing.")
+                 continue
+
             question = item["question"]
-            # HotpotQA has a single answer, but we'll put it in a list for consistency
-            answers = [item["answer"]]
-            
-            # Skip if any required field is missing
-            if not context or not question or not answers:
-                logger.warning(f"Skipping HotpotQA sample due to missing data")
+            answers = [item["answer"]] 
+
+            if not question or not answers or not answers[0]: 
+                logger.warning(f"Skipping HotpotQA sample {item.get('id', 'N/A')} due to missing question/answer")
                 continue
-            
+
             # Tokenize
             doc_tokens = tokenizer(context, add_special_tokens=False).input_ids
             question_tokens = tokenizer(question, add_special_tokens=False).input_ids
-            
+
             # Chunk document
             doc_chunks = chunk_document(doc_tokens, chunk_size)
-            
+
             # Skip if document chunks are empty
-            if not doc_chunks:
-                logger.warning(f"Skipping HotpotQA sample due to empty document chunks")
-                continue
-            
-            # Create metadata with supporting facts if available
+            if not doc_chunks or not doc_chunks[0]: 
+                 logger.warning(f"Skipping HotpotQA sample {item.get('id', 'N/A')} due to empty document chunks")
+                 continue
+
+            # Create metadata
             meta = {
                 "dataset": "hotpotqa",
                 "id": item.get("id", "N/A"),
                 "supporting_facts": item.get("supporting_facts", [])
             }
-            
+
             yield {
                 "doc_chunks": doc_chunks,
                 "question_ids": question_tokens,
                 "answers": answers,
                 "meta": meta
             }
-            
+
         except Exception as e:
-            logger.error(f"Error processing HotpotQA sample: {e}")
+            # Log the full exception for better debugging
+            logger.error(f"Error processing HotpotQA sample (split={split}, id={item.get('id', 'N/A')}): {e}", exc_info=True)
             continue
 
 def triviaqa_adapter(
@@ -206,69 +250,192 @@ def triviaqa_adapter(
     streaming: bool = True,
     chunk_size: int = 256,
 ) -> Iterator[Dict[str, Any]]:
-    """Adapter for TriviaQA dataset."""
+    """Adapter for TriviaQA dataset.
+    
+    Args:
+        tokenizer: Tokenizer for processing text
+        split: Dataset split to use
+        streaming: Whether to stream the dataset
+    """
+    # We need better debugging for validation data structure
+    debug_count = 0
+    debug_max = 3  # Number of validation samples to print for debugging
+        
+    if split == "validation":
+        logger.info(f"Attempting to load TriviaQA validation split...")
+    
     try:
-        dataset = load_dataset("trivia_qa", "rc", split=split, streaming=streaming)
-        logger.info(f"Successfully loaded TriviaQA dataset, split: {split}")
+        # For TriviaQA, we need to use the right split name
+        # For validation, try 'validation' first, then fallback to 'dev' if needed
+        actual_split = split
+        if split == "validation":
+            try:
+                dataset = load_dataset("trivia_qa", "rc", split="validation", streaming=streaming)
+                logger.info(f"Successfully loaded TriviaQA validation split.")
+            except Exception:
+                logger.warning(f"'validation' split not found for TriviaQA, trying 'dev' instead...")
+                try:
+                    dataset = load_dataset("trivia_qa", "rc", split="dev", streaming=streaming)
+                    logger.info(f"Successfully loaded TriviaQA 'dev' split.")
+                    actual_split = "dev"
+                except Exception as e:
+                    logger.error(f"Failed to load TriviaQA validation data with either 'validation' or 'dev' splits: {e}")
+                    return
+        else:
+            dataset = load_dataset("trivia_qa", "rc", split=split, streaming=streaming)
+            logger.info(f"Successfully loaded TriviaQA dataset, split: {split}")
     except Exception as e:
-        logger.error(f"Error loading TriviaQA: {e}")
+        logger.error(f"Error loading TriviaQA (split={split}): {e}")
         return
     
+    # Process dataset items
     for item in dataset:
+        # Print detailed debug info for the first few validation items
+        if split == "validation" and debug_count < debug_max:
+            logger.info(f"------- TriviaQA Validation Item {debug_count+1}/{debug_max} -------")
+            logger.info(f"Item ID: {item.get('question_id', 'N/A')}")
+            logger.info(f"Item keys: {sorted(list(item.keys()))}")
+            
+            # Print selected important fields
+            for key in ['question', 'answer', 'search_results', 'entity_pages', 'evidence', 'aliases']:
+                if key in item:
+                    value = item[key]
+                    if isinstance(value, list) and len(value) > 0:
+                        logger.info(f"{key} (first element): {value[0]}")
+                        if isinstance(value[0], dict) and len(value[0]) > 0:
+                            logger.info(f"{key}[0] keys: {sorted(list(value[0].keys()))}")
+                    else:
+                        logger.info(f"{key}: {value}")
+                else:
+                    logger.info(f"{key}: <not found>")
+            debug_count += 1
         try:
-            # Use the first evidence document
-            if not item["search_results"]:
-                logger.warning("Skipping TriviaQA sample with no search results")
-                continue
+            # Extract context based on document structure, with multiple fallback paths
+            context_source = None
+            evidence_found = False
+            context_paths = []
             
-            # Check if search context exists and is not empty
-            if not item["search_results"][0].get("search_context"):
-                logger.warning("Skipping TriviaQA sample with empty search context")
-                continue
-                
-            context = item["search_results"][0]["search_context"]
-            question = item["question"]
+            # Try search_results path first (common in training data)
+            search_results = item.get("search_results")
+            if search_results and isinstance(search_results, list) and len(search_results) > 0:
+                first_result = search_results[0]
+                if isinstance(first_result, dict) and "search_context" in first_result:
+                    context_source = first_result.get("search_context")
+                    context_paths.append("search_results[0].search_context")
             
-            # Check if answer aliases exist and are not empty
-            if not item.get("answer") or not item["answer"].get("aliases") or len(item["answer"]["aliases"]) == 0:
-                logger.warning("Skipping TriviaQA sample with no answer aliases")
-                continue
-                
-            # TriviaQA has multiple answer aliases, return as a list
-            answers = item["answer"]["aliases"]
+            # Try evidence path (common in validation data)
+            evidence = item.get("evidence")
+            if not context_source and evidence and isinstance(evidence, list) and len(evidence) > 0:
+                if isinstance(evidence[0], str):
+                    # If evidence is a list of strings, combine the first few
+                    evidence_texts = evidence[:3]  # Limit to first 3 pieces
+                    context_source = " ".join(evidence_texts)
+                    context_paths.append("evidence (strings)")
+                    evidence_found = True
+                elif isinstance(evidence[0], dict):
+                    # If evidence is a list of dicts, look for text fields
+                    for key in ["text", "content", "passage", "context"]:
+                        if key in evidence[0]:
+                            context_source = evidence[0][key]
+                            context_paths.append(f"evidence[0].{key}")
+                            evidence_found = True
+                            break
             
-            if not context or not question or not answers:
-                logger.warning("Skipping TriviaQA sample due to missing data")
-                continue
+            # Try entity_pages path
+            if not context_source and not evidence_found:
+                entity_pages = item.get("entity_pages")
+                if entity_pages and isinstance(entity_pages, list) and len(entity_pages) > 0:
+                    if isinstance(entity_pages[0], str):
+                        context_source = entity_pages[0]
+                        context_paths.append("entity_pages[0] (string)")
+                    elif isinstance(entity_pages[0], dict):
+                        # Try various possible field names
+                        for key in ["text", "content", "page_content", "wiki_context"]:
+                            if key in entity_pages[0]:
+                                context_source = entity_pages[0][key]
+                                context_paths.append(f"entity_pages[0].{key}")
+                                break
             
+            # Try wiki_context or normal context fields
+            if not context_source:
+                for key in ["wiki_context", "context", "text", "content"]:
+                    if key in item and item[key]:
+                        context_source = item[key]
+                        context_paths.append(key)
+                        break
+            
+            # Try aliases[0] as last resort (if present)
+            if not context_source and item.get("aliases") and len(item["aliases"]) > 0:
+                context_source = f"Question about: {item['aliases'][0]}"
+                context_paths.append("aliases[0]")
+            
+            # Last resort - minimal context with just the question
+            if not context_source:
+                if split == "validation":
+                    # For validation, use the question itself as minimal context
+                    question = item.get("question", "Unknown question")
+                    context_source = f"Question: {question}"
+                    context_paths.append("question (fallback)")
+                    # Log this case
+                    logger.info(f"Using question as minimal context for TriviaQA sample {item.get('question_id', 'N/A')}")
+                else:
+                    # For training, we can be more selective
+                    logger.warning(f"Skipping TriviaQA sample {item.get('question_id', 'N/A')} with no usable context source found.")
+                    continue
+                    
+            # Log which path we ended up using for debugging
+            if split == "validation" and debug_count <= debug_max:
+                logger.info(f"Context source path(s): {context_paths}")
+                    
+            context = context_source # Use the context we found
+
+            question = item.get("question")
+            answer_data = item.get("answer")
+
+            if not question:
+                logger.warning(f"Skipping TriviaQA sample {item.get('question_id', 'N/A')} with no question")
+                continue
+
+            if not answer_data or not isinstance(answer_data, dict):
+                 logger.warning(f"Skipping TriviaQA sample {item.get('question_id', 'N/A')} with missing or malformed answer data")
+                 continue
+
+            aliases = answer_data.get("aliases")
+            if not aliases or not isinstance(aliases, list) or len(aliases) == 0:
+                logger.warning(f"Skipping TriviaQA sample {item.get('question_id', 'N/A')} with no answer aliases")
+                continue
+
+            answers = aliases # TriviaQA has multiple answer aliases
+
             # Tokenize
             doc_tokens = tokenizer(context, add_special_tokens=False).input_ids
             question_tokens = tokenizer(question, add_special_tokens=False).input_ids
-            
+
             # Chunk document
             doc_chunks = chunk_document(doc_tokens, chunk_size)
-            
+
             # Skip if document chunks are empty
-            if not doc_chunks:
-                logger.warning("Skipping TriviaQA sample due to empty document chunks")
-                continue
-            
+            if not doc_chunks or not doc_chunks[0]: 
+                 logger.warning(f"Skipping TriviaQA sample {item.get('question_id', 'N/A')} due to empty document chunks")
+                 continue
+
             # Create metadata
             meta = {
                 "dataset": "triviaqa",
-                "id": item.get("id", "N/A"),
+                "id": item.get("question_id", item.get("id", "N/A")), 
                 "entity_pages": item.get("entity_pages", [])
             }
-            
+
             yield {
                 "doc_chunks": doc_chunks,
                 "question_ids": question_tokens,
                 "answers": answers,
                 "meta": meta
             }
-            
+
         except Exception as e:
-            logger.error(f"Error processing TriviaQA sample: {e}")
+            # Log the full exception for better debugging
+            logger.error(f"Error processing TriviaQA sample (split={split}, id={item.get('question_id', 'N/A')}): {e}", exc_info=True) 
             continue
 
 def nq_adapter(
@@ -353,6 +520,9 @@ DATASET_ADAPTERS = {
 DATASET_CONFIG = {
     "narrativeqa": {
         "use_summaries": True,  # Use summaries instead of full stories by default
+    },
+    "triviaqa": {
+        "skip_validation": False  # Option to skip TriviaQA validation data if it causes issues
     }
 }
 
@@ -365,7 +535,6 @@ def get_dataset_iterator(dataset_name: str, tokenizer: PreTrainedTokenizerFast, 
         dataset_name: Name of the dataset to load
         tokenizer: Tokenizer for processing text
         split: Dataset split to use
-        chunk_size: Size of document chunks
         
     Returns:
         Iterator yielding dataset examples in standardized dictionary format
@@ -560,10 +729,10 @@ class CurriculumDataLoader:
     The loader starts with the easiest dataset (NarrativeQA) and adds more challenging
     datasets as the agent's performance improves, measured by QA score thresholds.
     
-    Note: Once a dataset is added to the mix, it remains active even if the agent's
-    performance later drops below the threshold that triggered its addition. This
-    design choice encourages the agent to adapt to the more challenging mix rather
-    than reverting to easier datasets when performance temporarily regresses.
+    Note: Once a dataset is added to the mix, it remains active even if performance
+    later drops below the threshold that triggered its addition. This design choice
+    encourages the agent to adapt to the more challenging mix rather than reverting
+    to easier datasets when performance temporarily regresses.
     """
     
     def __init__(
@@ -680,4 +849,3 @@ class CurriculumDataLoader:
         def data_loader_fn():
             return self.current_iterator
         return data_loader_fn
-        yield next(iters[i])

@@ -1,7 +1,7 @@
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
-from typing import Iterable, Dict, Any, Tuple, List, Callable
+from typing import Iterable, Dict, Any, Callable
 from transformers import AutoTokenizer
 from utils.llm_interface import LLMInterface
 from utils.model_paths import llama_32_3b
@@ -17,8 +17,8 @@ _TOKENIZER_NAME = "NousResearch/Meta-Llama-3.1-8B"
 
 # top‑level constants (tune later)
 ALPHA      = 0.05   # token cost
-BETA_KEEP  = 0.005  # keep penalty
-BETA_COMP  = 0.002  # compress penalty
+BETA_KEEP  = -0.008  # keep penalty (negative because it's a cost)
+BETA_COMP  = -0.002  # compress penalty (negative because it's a cost)
 GAMMA_STEP = 0.001  # per‑step thrift penalty
 
 tokenizer = AutoTokenizer.from_pretrained(
@@ -50,6 +50,10 @@ class StreamingQAGym(gym.Env):
                  dataset_name: str = "deepmind/narrativeqa",
                  split: str = "train",
                  max_window: int = _MAX_WINDOW,
+                 alpha: float = ALPHA,
+                 beta_keep: float = BETA_KEEP,
+                 beta_compress: float = BETA_COMP,
+                 gamma_step: float = GAMMA_STEP, # Add gamma_step parameter
                  data_loader_fn: Callable[[], Iterable[Dict[str, Any]]] = None,
                  chunk_size: int = _CHUNK_SIZE,
                  token_reward_max: float = 0.1,      # Maximum per-episode token reward
@@ -60,7 +64,9 @@ class StreamingQAGym(gym.Env):
         self.dataset_name = dataset_name
         self.split = split
         self.data_loader_fn = data_loader_fn
-        self.ds_iter = iter(self.data_loader_fn()) if self.data_loader_fn is not None else None
+        # Remove the iterator creation from __init__
+        # Each parallel environment needs its own iterator
+        self.ds_iter = None
         self.max_window = max_window
         self.chunk_size = chunk_size
         
@@ -90,18 +96,24 @@ class StreamingQAGym(gym.Env):
         # scalar: 0=DROP, 1=KEEP
         self.action_space = spaces.Discrete(2)
 
+        self.gamma_step = gamma_step  # Store gamma_step
+        self.alpha = alpha
+        self.beta_keep = beta_keep  # Store beta_keep correctly
+        self.beta_compress = beta_compress
+
         self._reset_episode_state()
 
     # ------------------------------------------------------------------------
     def _reset_episode_state(self):
-        """Prepare a fresh doc‑question pair."""
-        self.doc_chunks = None
-        self.stored_tokens = []            # rolling context buffer
-        self.question_ids = None
-        self.gold_answer = None            # Primary answer string
-        self.gold_answers = []             # List of reference answers
-        self.gold_answer_token_ids = set()  # Will hold tokenized gold answer for heuristic rewards
-        self.chunk_idx = 0
+        """Reset all episode-specific state variables."""
+        self.chunk_idx = 0          # index into the current doc chunks
+        self.stored_tokens = []     # token ids we're keeping so far
+        self.keep_count = 0         # number of chunks we've kept
+        self.drop_count = 0         # number of chunks we've dropped
+        self.compress_count = 0     # number of chunks we've compressed (future)
+        self.gold_answer = None
+        self.gold_answers = None    # Multi-reference version
+        self.gold_answer_token_ids = set()  # for use in gold token reward heuristic
         self.steps_left = None             # filled during reset()
 
     # ------------------------------------------------------------------------
@@ -109,28 +121,23 @@ class StreamingQAGym(gym.Env):
         """Draw one (long_doc, question, answer) triplet from data loader.
         If the iterator is exhausted, recreate it by calling the loader function."""
         
-        if self.ds_iter is None:
-            if self.data_loader_fn is None:
-                raise RuntimeError("Dataset loader function was not provided during initialization.")
-            else:
-                # Attempt to create iterator if it wasn't created initially
-                self.ds_iter = iter(self.data_loader_fn())
+        # Always create a fresh iterator for each episode - critical for parallel environments
+        if self.data_loader_fn is None:
+            raise RuntimeError("Dataset loader function was not provided during initialization.")
+            
+        self.ds_iter = iter(self.data_loader_fn())
             
         # Get the next example (dictionary format)
         try:
             example = next(self.ds_iter)  # throws StopIteration when exhausted
         except StopIteration:
-            if self.data_loader_fn is None:
-                raise RuntimeError("Cannot reset iterator: Dataset loader function was not provided.")
-                 
-            # If iterator is exhausted, recreate it by calling the loader function again
-            print("[StreamingQAGym] Data iterator exhausted. Resetting by calling data_loader_fn.")
-            self.ds_iter = iter(self.data_loader_fn()) # Reset the iterator using the loader function
+            # If first attempt fails, try one more time with a fresh iterator
+            print("Data iterator exhausted, rebuilding...")
+            self.ds_iter = iter(self.data_loader_fn())
             try:
                 example = next(self.ds_iter)
             except StopIteration:
-                # If still no data after reset, the loader function might be returning an empty/exhausted iterator
-                raise RuntimeError("Dataset loader function failed to yield any examples after reset")
+                raise RuntimeError("Dataset empty even after iterator reset!")
             
         # Extract and store values from the dictionary
         self.doc_chunks = example["doc_chunks"]
@@ -216,6 +223,9 @@ class StreamingQAGym(gym.Env):
             truncated : bool (always False)
             info      : dict
         """
+        # Increment global step count for annealing
+        self.global_step += 1
+        
         # ------------------------
         # 1) Did we already finish streaming?
         # ------------------------
@@ -246,8 +256,8 @@ class StreamingQAGym(gym.Env):
             # Use multi-reference QA score for reward
             qa_score = compute_qa_score_multi(self.gold_answers, model_answer)
             
-            token_penalty = ALPHA * (len(prompt_ids) / self.max_window)
-            reward = qa_score - token_penalty
+            token_penalty = self.alpha * (len(prompt_ids) / self.max_window)
+            final_reward = qa_score - token_penalty
 
             # Return an “empty” obs and terminate
             obs = np.full(self.chunk_size, tokenizer.pad_token_id, dtype=np.int32)
@@ -262,41 +272,52 @@ class StreamingQAGym(gym.Env):
                 "model_answer": model_answer,
                 "gold_answer":  self.gold_answer,
                 "gold_answers": self.gold_answers,
+                "keep_count":   self.keep_count, # Log keep count
+                "drop_count":   self.drop_count, # Log drop count
             }
-            return obs, reward, True, False, info
+            return obs, final_reward, True, False, info
 
         # ------------------------
-        # 2) Still in streaming phase: apply action cost + extend tokens
+        # 2) Still in streaming phase: process action, update state
         # ------------------------
+        # Initialize step reward with the base per-step penalty
+        step_reward = -self.gamma_step 
+        token_heuristic_reward = 0.0 
+        current_chunk = self.doc_chunks[self.chunk_idx]
+
         if action == 1:  # KEEP
-            current_chunk = self.doc_chunks[self.chunk_idx]
-            self.stored_tokens.extend(current_chunk)
-            
-            # Apply base cost for keeping
-            reward = - (GAMMA_STEP + BETA_KEEP)
-            
-            # Add dynamic heuristic reward if gold answer tokens present in this chunk
-            if self.gold_answer_token_ids:
-                # Check for overlap between current chunk and gold answer tokens
-                overlap = set(current_chunk) & self.gold_answer_token_ids
-                if overlap:
-                    # Dynamic scaling based on answer length and training progress
-                    token_hit = len(overlap)  # Count number of matching tokens
-                    
-                    # Scale per-token reward (max total = token_reward_max)
-                    if len(self.gold_answer_token_ids) > 0:  # Avoid division by zero
-                        per_token = self.token_reward_max / len(self.gold_answer_token_ids)
-                    else:
-                        per_token = 0.01  # Fallback if no gold tokens
-                    
-                    # Anneal rewards over time (start strong, fade to 10%)
-                    anneal = max(0.1, 1.0 - self.global_step / self.token_reward_anneal_steps) 
-                    
-                    # Apply the scaled and annealed reward
-                    token_reward = token_hit * per_token * anneal
-                    reward += token_reward
-        else:            # DROP (or future COMPRESS)
-            reward = 0.0
+            # Check window constraint BEFORE adding
+            if len(self.stored_tokens) + len(current_chunk) <= self.max_window:
+                self.stored_tokens.extend(current_chunk)
+                self.keep_count += 1 
+                
+                # Calculate heuristic reward (if applicable)
+                if self.gold_answer_token_ids:
+                    overlap = set(current_chunk) & self.gold_answer_token_ids
+                    if overlap:
+                        token_hit = len(overlap)
+                        if len(self.gold_answer_token_ids) > 0:
+                            per_token = self.token_reward_max / len(self.gold_answer_token_ids)
+                        else:
+                            per_token = 0.01 # Fallback
+                        anneal = max(0.1, 1.0 - self.global_step / self.token_reward_anneal_steps) 
+                        token_heuristic_reward = token_hit * per_token * anneal
+                
+                # Apply the keep cost and heuristic bonus to the step reward
+                # Since beta_keep is negative, adding it applies the cost.
+                step_reward += self.beta_keep + token_heuristic_reward
+                
+            else:
+                # Implicit DROP due to window full
+                action = 0 
+                self.drop_count += 1 
+                # Apply beta_keep cost anyway to penalize KEEP attempts that overflow
+                # This ensures the agent learns to respect window constraints
+                step_reward += self.beta_keep
+    
+        if action == 0: # Explicit DROP
+            self.drop_count += 1 
+            # No additional cost/reward beyond gamma_step for explicit drop
 
         # ------------------------
         # 3) Advance to next chunk index
@@ -310,13 +331,13 @@ class StreamingQAGym(gym.Env):
         if self.chunk_idx < len(self.doc_chunks):
             obs  = self._pad(self.doc_chunks[self.chunk_idx], self.chunk_size)
             info = {"step_idx": self.chunk_idx}
-            return obs, reward, False, False, info
+            return obs, step_reward, False, False, info
 
         # 4b) Exactly at question
         if self.chunk_idx == len(self.doc_chunks):
             obs  = self._pad(self.question_ids, self.chunk_size)
             info = {"step_idx": self.chunk_idx, "question": True}
-            return obs, reward, False, False, info
+            return obs, step_reward, False, False, info
 
     # ------------------------------------------------------------------------
     def _query_llm(self, prompt_ids):
@@ -332,14 +353,21 @@ class StreamingQAGym(gym.Env):
         # Convert token IDs to text
         prompt_text = tokenizer.decode(prompt_ids, skip_special_tokens=True)
         
-        # Extract the question from the prompt (assuming it's at the end)
+        # Extract the question from the prompt using slicing by length
         question_text = tokenizer.decode(self.question_ids, skip_special_tokens=True)
         
         # Create a system prompt
         system_prompt = "You are a helpful, accurate, and concise assistant. Answer questions based on the provided document."
         
-        # Format the prompt for our improved LLMInterface
-        context_text = prompt_text.replace(question_text, "")
+        # Use slicing to safely separate context from question
+        # First check if prompt_text is at least as long as question_text
+        if len(prompt_text) >= len(question_text):
+            # Extract just the context portion by slicing off the question length from the end
+            context_text = prompt_text[:-len(question_text)].strip()
+        else:
+            # Safety fallback (should not happen in normal operation)
+            context_text = prompt_text
+            
         user_message = f"Document: {context_text}\n\nQuestion: {question_text}\n\nProvide a direct and concise answer."
         
         # Generate the answer using our improved interface

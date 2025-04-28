@@ -1,6 +1,6 @@
 # src/curricula/length_schedule.py
 
-from typing import Dict, Any, Iterable, Iterator, List, Tuple, Union
+from typing import Dict, Any, Iterable, Iterator
 import numpy as np
 
 class LengthScheduleWrapper(Iterator[Dict[str, Any]]):

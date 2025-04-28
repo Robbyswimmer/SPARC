@@ -88,6 +88,11 @@ class ValidationCallback(BaseCallback):
         Returns:
             True to continue training
         """
+        # Debug: Print timestep info every 10 steps
+        if self.verbose > 0 and self.n_calls % 10 == 0:
+            print(f"Debug: ValidationCallback - n_calls={self.n_calls}, num_timesteps={self.num_timesteps}, eval_freq={self.eval_freq}")
+            print(f"Debug: Next validation at timestep {(self.num_timesteps // self.eval_freq + 1) * self.eval_freq if self.num_timesteps > 0 else self.eval_freq}")
+        
         # Skip if not at evaluation frequency or no eval env
         if self.eval_env is None or self.num_timesteps % self.eval_freq != 0:
             return True

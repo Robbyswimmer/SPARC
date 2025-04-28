@@ -55,6 +55,35 @@ class ChunkCurriculumCallback(BaseCallback):
                     pass  # Ignore wandb errors
         return True
 
+# Custom callback to periodically render environment
+class RenderCallback(BaseCallback):
+    """Callback for rendering environment periodically during training."""
+    
+    def __init__(self, render_freq=100, verbose=0):
+        super().__init__(verbose)
+        self.render_freq = render_freq
+        self.last_timesteps = 0
+    
+    def _on_step(self) -> bool:
+        # Get current global step number
+        current_timesteps = self.model.num_timesteps
+        
+        # Check if we've passed a multiple of render_freq since last render
+        steps_since_last = current_timesteps - self.last_timesteps
+        
+        # Only render if we've added at least render_freq more steps
+        if steps_since_last >= self.render_freq:
+            print(f"\n\n[RenderCallback] Rendering at step {current_timesteps}")
+            try:
+                # Render the first environment
+                self.training_env.env_method("render", indices=[0])
+                # Update last render timestep
+                self.last_timesteps = current_timesteps
+                print("[RenderCallback] Render completed successfully")
+            except Exception as e:
+                print(f"[RenderCallback] Error rendering: {e}")
+        return True
+
 @hydra.main(version_base=None, config_path="../conf", config_name="config")
 def main(cfg: DictConfig):
 
@@ -282,7 +311,10 @@ def main(cfg: DictConfig):
 
     run_name = f"{cfg.exp.name}-{wandb.util.generate_id()}"
     # Setup callbacks
-    callbacks = [WandbCallback(project=cfg.wandb.project, run_name=run_name)]
+    callbacks = [
+        WandbCallback(project=cfg.wandb.project, run_name=run_name),
+        RenderCallback(render_freq=100)  # Render visualization every 100 steps
+    ]
     
     # Add chunk length curriculum callback if enabled
     if cfg.curriculum.enabled and state_refs['chunk_curriculum_wrapper'] is not None:

@@ -18,7 +18,6 @@ _TOKENIZER_NAME = "NousResearch/Meta-Llama-3.1-8B"
 # top‑level constants (tune later)
 ALPHA      = 0.05   # token cost
 BETA_KEEP  = -0.008  # keep penalty (negative because it's a cost)
-BETA_COMP  = -0.002  # compress penalty (negative because it's a cost)
 GAMMA_STEP = 0.001  # per‑step thrift penalty
 
 tokenizer = AutoTokenizer.from_pretrained(
@@ -52,7 +51,6 @@ class StreamingQAGym(gym.Env):
                  max_window: int = _MAX_WINDOW,
                  alpha: float = ALPHA,
                  beta_keep: float = BETA_KEEP,
-                 beta_compress: float = BETA_COMP,
                  gamma_step: float = GAMMA_STEP, # Add gamma_step parameter
                  data_loader_fn: Callable[[], Iterable[Dict[str, Any]]] = None,
                  chunk_size: int = _CHUNK_SIZE,
@@ -98,8 +96,7 @@ class StreamingQAGym(gym.Env):
 
         self.gamma_step = gamma_step  # Store gamma_step
         self.alpha = alpha
-        self.beta_keep = beta_keep  # Store beta_keep correctly
-        self.beta_compress = beta_compress
+        self.beta_keep = beta_keep  
 
         self._reset_episode_state()
 
@@ -110,7 +107,6 @@ class StreamingQAGym(gym.Env):
         self.stored_tokens = []     # token ids we're keeping so far
         self.keep_count = 0         # number of chunks we've kept
         self.drop_count = 0         # number of chunks we've dropped
-        self.compress_count = 0     # number of chunks we've compressed (future)
         self.gold_answer = None
         self.gold_answers = None    # Multi-reference version
         self.gold_answer_token_ids = set()  # for use in gold token reward heuristic
@@ -289,6 +285,12 @@ class StreamingQAGym(gym.Env):
             # Check window constraint BEFORE adding
             if len(self.stored_tokens) + len(current_chunk) <= self.max_window:
                 self.stored_tokens.extend(current_chunk)
+
+                # Always truncate to max_window immediately after extending
+                # This ensures stored_tokens never exceeds max_window capacity
+                if len(self.stored_tokens) > self.max_window:
+                    self.stored_tokens = self.stored_tokens[-self.max_window:]
+                
                 self.keep_count += 1 
                 
                 # Calculate heuristic reward (if applicable)
@@ -311,9 +313,9 @@ class StreamingQAGym(gym.Env):
                 # Implicit DROP due to window full
                 action = 0 
                 self.drop_count += 1 
-                # Apply beta_keep cost anyway to penalize KEEP attempts that overflow
-                # This ensures the agent learns to respect window constraints
-                step_reward += self.beta_keep
+                # NOTE: We don't apply beta_keep here to avoid double penalty
+                # The agent already pays the gamma_step cost, which should be enough
+                # to discourage window overflows
     
         if action == 0: # Explicit DROP
             self.drop_count += 1 
@@ -387,3 +389,123 @@ class StreamingQAGym(gym.Env):
     def set_global_step(self, step: int):
         """Set the global training step for reward annealing."""
         self.global_step = step
+        
+    def render(self, mode='human'):
+        """Render the environment's current state.
+        
+        Shows the question, document chunks that were kept vs. dropped,
+        and metrics for qualitative analysis and publication figures.
+        
+        Args:
+            mode: Rendering mode. Only 'human' is supported currently.
+        
+        Returns:
+            None
+        """
+        if mode != 'human':
+            raise NotImplementedError(f"Render mode {mode} not supported")
+        
+        # Print header
+        print("\n" + "="*80)
+        print(f"STREAMING QA ENVIRONMENT STATE")
+        print("="*80)
+        
+        # Print question and answer if available
+        if self.question_ids:
+            question_text = tokenizer.decode(self.question_ids, skip_special_tokens=True)
+            print(f"\nQUESTION: {question_text}")
+        else:
+            print("\nQUESTION: [Not available yet]")
+            
+        if self.gold_answer:
+            print(f"GOLD ANSWER: {self.gold_answer}")
+        else:
+            print(f"GOLD ANSWER: [Not available]")
+        
+        # Track which chunks have been kept
+        kept_chunks = []
+        dropped_chunks = []
+        
+        # Ensure we only count actual document chunks, not the question
+        doc_chunks_seen = min(self.chunk_idx, len(self.doc_chunks))
+        
+        # Store decisions for visualization
+        chunk_decisions = []
+        
+        # Get data on explicit decisions made so far
+        for i in range(doc_chunks_seen):
+            chunk = self.doc_chunks[i]
+            chunk_text = tokenizer.decode(chunk, skip_special_tokens=True)
+            
+            # Better detection of kept chunks - check first few tokens to reduce false positives
+            # but also not be too strict given potential token splitting differences
+            sample_tokens = set(chunk[:min(10, len(chunk))])  # Take first 10 tokens or fewer
+            is_kept = bool(sample_tokens.intersection(set(self.stored_tokens)))
+            
+            if is_kept:
+                kept_chunks.append((i, chunk_text, len(chunk)))
+            else:
+                dropped_chunks.append((i, chunk_text, len(chunk)))
+        
+        # Print kept chunks
+        print("\nKEPT CHUNKS:")
+        print("-" * 80)
+        if kept_chunks:
+            for idx, text, length in kept_chunks:
+                first_line = text[:60] + "..." if len(text) > 60 else text
+                print(f"[{idx}] KEEP - {first_line} ({length} tokens)")
+        else:
+            print("[No chunks kept yet]")
+        print("-" * 80)
+        
+        # Print dropped chunks
+        print("\nDROPPED CHUNKS:")
+        print("-" * 80)
+        if dropped_chunks:
+            for idx, text, length in dropped_chunks:
+                first_line = text[:60] + "..." if len(text) > 60 else text
+                print(f"[{idx}] DROP - {first_line} ({length} tokens)")
+        else:
+            print("[No chunks dropped yet]")
+        print("-" * 80)
+        
+        # Print unseen chunks
+        print("\nUNSEEN CHUNKS:")
+        print("-" * 80)
+        future_chunks = len(self.doc_chunks) - self.chunk_idx
+        if future_chunks > 0:
+            print(f"[{future_chunks} chunks not yet processed]")
+        else:
+            print("[All chunks processed]")
+        print("-" * 80)
+        
+        # Print metrics
+        print("\nMETRICS:")
+        print(f"Document chunks: {len(self.doc_chunks)}")
+        
+        # Separately track document chunks vs. question
+        if self.chunk_idx <= len(self.doc_chunks):
+            print(f"Doc chunks seen: {doc_chunks_seen} / {len(self.doc_chunks)}")
+        else:
+            # We've reached the question
+            print(f"Doc chunks seen: {len(self.doc_chunks)} / {len(self.doc_chunks)} (Complete)")
+            print(f"Question seen: Yes")
+        
+        print(f"Chunks kept: {len(kept_chunks)}")
+        print(f"Chunks dropped: {len(dropped_chunks)}")
+        if doc_chunks_seen > 0 and (len(kept_chunks) + len(dropped_chunks)) > 0:
+            keep_ratio = len(kept_chunks)/(len(kept_chunks) + len(dropped_chunks))
+            print(f"Keep ratio: {keep_ratio:.2f}")
+        else:
+            print("Keep ratio: N/A")
+        print(f"Tokens stored: {len(self.stored_tokens)} / {self.max_window} (max window)")
+        
+        # Calculate compression as stored tokens / theoretical max tokens
+        # This shows efficiency vs. the full potential token capacity
+        if len(self.doc_chunks) > 0:
+            # Using the formula: tokens_stored / (len(doc_chunks) * chunk_size)
+            theoretical_max = len(self.doc_chunks) * self.chunk_size
+            compression_ratio = len(self.stored_tokens) / theoretical_max
+            print(f"Compression ratio: {compression_ratio:.4f} ({len(self.stored_tokens)}/{theoretical_max})")
+        
+        print("="*80)

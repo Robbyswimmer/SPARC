@@ -57,12 +57,16 @@ class WandbCallback(BaseCallback):
         
         # EMA tracking for smoothed metrics
         self.ema_alpha = ema_alpha  # Lower alpha = more smoothing (0.05 is quite smooth)
+        self.loss_metrics_last_logged = 0  # Track the last n_updates when loss was logged
         self.smoothed_metrics = {
             "qa_score_ema": None,
             "f1_ema": None,
             "em_ema": None,
             "episode_reward_ema": None,
-            "tokens_used_ema": None
+            "tokens_used_ema": None,
+            "keep_count_ema": None,
+            "drop_count_ema": None,
+            "keep_ratio_ema": None
         }
 
     def _on_training_start(self) -> None:
@@ -83,7 +87,25 @@ class WandbCallback(BaseCallback):
         train_metrics["global_step"] = self.num_timesteps
         self._wandb.log(train_metrics)
 
-        # 2) Log episode metrics upon termination
+        # 2) Log loss metrics if present
+        # These are available during the update phase
+        loss_vals = self.locals.get("loss_vals")
+        if loss_vals is not None and self.model.n_updates > self.loss_metrics_last_logged:
+            # Track that we've logged for this update step
+            self.loss_metrics_last_logged = self.model.n_updates
+            loss_log_data = {
+                "loss/policy": float(loss_vals.get('pg_loss', 0)),
+                "loss/value": float(loss_vals.get('value_loss', 0)),
+                "loss/entropy": float(loss_vals.get('entropy', 0)),
+                "loss/approx_kl": float(loss_vals.get('approx_kl', 0)),
+                "loss/clip_fraction": float(loss_vals.get('clip_fraction', 0)),
+                "loss/loss": float(loss_vals.get('loss', 0)),
+                "global_step": self.num_timesteps,
+                "n_updates": self.model.n_updates,
+            }
+            self._wandb.log(loss_log_data)
+
+        # 3) Log episode metrics upon termination
         # Stable Baselines3 provides episode info in `infos` when `dones` is True
         infos = self.locals.get("infos")
         dones = self.locals.get("dones")
@@ -104,6 +126,15 @@ class WandbCallback(BaseCallback):
                 em = info.get("exact_match", None)
                 f1 = info.get("f1", None)
                 tokens_used = info.get("tokens_used", None)
+                keep_count = info.get("keep_count", None)  # Get keep_count
+                drop_count = info.get("drop_count", None)  # Get drop_count
+                
+                # Initialize keep_ratio here to avoid UnboundLocalError
+                keep_ratio = None
+                if keep_count is not None and drop_count is not None:
+                    total_decisions = keep_count + drop_count
+                    if total_decisions > 0:
+                        keep_ratio = keep_count / total_decisions
 
                 if qa_score is not None:
                     # Update EMAs
@@ -115,7 +146,10 @@ class WandbCallback(BaseCallback):
                         ("f1_ema", f1),
                         ("em_ema", em),
                         ("episode_reward_ema", episode_reward),
-                        ("tokens_used_ema", tokens_used)
+                        ("tokens_used_ema", tokens_used),
+                        ("keep_count_ema", keep_count),
+                        ("drop_count_ema", drop_count),
+                        ("keep_ratio_ema", keep_ratio)
                     ]:
                         if current_value is not None:
                             if self.smoothed_metrics[metric_name] is None:
@@ -136,6 +170,9 @@ class WandbCallback(BaseCallback):
                         "f1": f1,
                         "qa_score": qa_score,
                         "tokens_used": tokens_used,
+                        "keep_count": keep_count,  # Log keep_count
+                        "drop_count": drop_count,  # Log drop_count
+                        "keep_ratio": keep_ratio,  # Log keep ratio
                         "global_step": self.num_timesteps,
                     }
                     

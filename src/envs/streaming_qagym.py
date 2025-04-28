@@ -17,7 +17,7 @@ _TOKENIZER_NAME = "NousResearch/Meta-Llama-3.1-8B"
 
 # top‑level constants (tune later)
 ALPHA      = 0.05   # token cost
-BETA_KEEP  = -0.005  # keep penalty (negative because it's a cost)
+BETA_KEEP  = -0.008  # keep penalty (negative because it's a cost)
 BETA_COMP  = -0.002  # compress penalty (negative because it's a cost)
 GAMMA_STEP = 0.001  # per‑step thrift penalty
 

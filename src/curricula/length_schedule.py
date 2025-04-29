@@ -79,9 +79,6 @@ class LengthScheduleWrapper(Iterator[Dict[str, Any]]):
             # We need at least min_chunks, up to current_max_chunks, but no more than available
             effective_max_chunks = min(max(self.min_chunks, current_max_chunks), original_num_chunks)
             truncated_chunks = doc_chunks[:effective_max_chunks]
-            # Log info (optional - you might want to remove these prints in production)
-            if effective_max_chunks < original_num_chunks:
-                print(f"Curriculum: Using {effective_max_chunks}/{original_num_chunks} chunks")
         else:
             # Handle cases where doc_chunks might not be a list
             print(f"Warning: doc_chunks is not a list. Skipping truncation.")

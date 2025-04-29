@@ -59,14 +59,6 @@ class CurriculumCallback(BaseCallback):
         make curriculum progression decisions. This approach is more stable than
         using on-policy rollout metrics, which can be noisy due to PPO exploration.
         """
-        # Debug: Print timestep info every 10 steps
-        if self.verbose > 0 and self.n_calls % 10 == 0:
-            print(f"Debug: CurriculumCallback - n_calls={self.n_calls}, num_timesteps={self.num_timesteps}, last_update_step={self.last_update_step}")
-            if self.validation_callback is not None:
-                print(f"Debug: ValidationCallback has metrics: {hasattr(self.validation_callback, 'last_metrics') and self.validation_callback.last_metrics is not None}")
-                if hasattr(self.validation_callback, 'last_metrics') and self.validation_callback.last_metrics:
-                    print(f"Debug: Validation metrics: {self.validation_callback.last_metrics}")
-        
         # Only check for curriculum updates after validation runs
         if self.validation_callback is None or self.num_timesteps <= self.last_update_step:
             return True

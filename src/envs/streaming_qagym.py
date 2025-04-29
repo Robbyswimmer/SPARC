@@ -243,6 +243,7 @@ class StreamingQAGym(gym.Env):
 
             # Query LLM and score
             model_answer = self._query_llm(prompt_ids)
+            self.last_llm_answer = model_answer  # Store for rendering
 
             # Print Q&A every 20 global environment steps
             if self.global_env_step % 25 == 0:
@@ -422,18 +423,17 @@ class StreamingQAGym(gym.Env):
         print(f"STREAMING QA ENVIRONMENT STATE")
         print("="*80)
         
-        # Print question and answer if available
+        # Print question, LLM answer, and gold answer if available
         if self.question_ids:
             question_text = tokenizer.decode(self.question_ids, skip_special_tokens=True)
             print(f"\nQUESTION: {question_text}")
-        else:
-            print("\nQUESTION: [Not available yet]")
-            
+        if hasattr(self, 'last_llm_answer') and self.last_llm_answer:
+            print(f"LLM ANSWER: {self.last_llm_answer}")
         if self.gold_answer:
             print(f"GOLD ANSWER: {self.gold_answer}")
         else:
             print(f"GOLD ANSWER: [Not available]")
-        
+            
         # Track which chunks have been kept
         kept_chunks = []
         dropped_chunks = []

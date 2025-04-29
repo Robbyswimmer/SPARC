@@ -50,7 +50,7 @@ train:
 wandb:
   project: SPARC
 eval:
-  frequency: 10   # Evaluate every 10k steps
+  frequency: 100   # Evaluate every 10k steps
   episodes: 1      # Number of episodes to evaluate on
   deterministic: true
   save_path: "./checkpoints/" # Directory to save best model checkpoints

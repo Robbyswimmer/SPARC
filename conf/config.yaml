@@ -3,13 +3,22 @@ exp:
 data:
   datasets: [narrativeqa, hotpotqa, triviaqa, nq_long]  # All available datasets
   dataset_order: [narrativeqa, hotpotqa, triviaqa, nq_long]  # From easiest to hardest
+  validation_cache_dir: "data/validation_cache" # Relative path to validation cache
   curriculum_enabled: true  # Enable dataset curriculum
   qa_thresholds: [0.3, 0.4, 0.5]  # QA score thresholds to unlock next dataset
   split: train
   dataset_config:  # Dataset-specific configuration
     narrativeqa:
       use_summaries: true  # Use summaries instead of full stories for NarrativeQA
-    # Add other dataset-specific configurations as needed
+    triviaqa:
+      skip_validation: false      # Option to skip TriviaQA validation data if it causes issues
+      use_synthetic_fallback: true # Generate synthetic context when real context isn't found
+      include_aliases: true       # Include alias information in context when available
+      debug_context_paths: false  # Print detailed context extraction paths for debugging
+    nq_long:
+      use_synthetic_context: true # If True, creates synthetic context from question+answers
+      max_context_length: 1024    # Maximum context length to use when real context is available
+      context_padding: true       # Add generic padding to short contexts to make task more realistic
 env:
   chunk_size: 256
   max_window: 2048
@@ -41,9 +50,10 @@ train:
 wandb:
   project: SPARC
 eval:
-  frequency: 10000   # Evaluate every 10k steps
-  episodes: 20      # Number of episodes to evaluate on
+  frequency: 10   # Evaluate every 10k steps
+  episodes: 1      # Number of episodes to evaluate on
   deterministic: true
   save_path: "./checkpoints/" # Directory to save best model checkpoints
   seed: 123  # Random seed for evaluation
   name_prefix: "sparc_best_model" # Prefix for the best model filename
+  validation_cache_size: 500  # Number of validation examples to cache for deterministic evaluation

@@ -12,7 +12,7 @@ Verifies that each dataset adapter in the registry:
 import pytest
 import os
 import sys
-from typing import Dict, Any, Iterator, List
+from typing import Dict, Any
 import tqdm
 import time
 

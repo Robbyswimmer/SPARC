@@ -84,6 +84,7 @@ class StreamingQAGym(gym.Env):
             temperature=0.0
         )
         self.question_ids = []  # Initialize empty, will be set in reset()
+        self.global_env_step = 0  # Global environment step counter (not reset per episode)
 
         # ------------- observation & action spaces -------------------------
         # 1‑D array of token ids for **current** chunk
@@ -221,6 +222,8 @@ class StreamingQAGym(gym.Env):
         """
         # Increment global step count for annealing
         self.global_step += 1
+        # Increment global environment step count (never resets)
+        self.global_env_step += 1
         
         # ------------------------
         # 1) Did we already finish streaming?
@@ -240,7 +243,16 @@ class StreamingQAGym(gym.Env):
 
             # Query LLM and score
             model_answer = self._query_llm(prompt_ids)
-            
+
+            # Print Q&A every 20 global environment steps
+            if self.global_env_step % 25 == 0:
+                question_text = tokenizer.decode(self.question_ids, skip_special_tokens=True)
+                print("\n[StreamingQAGym] Global Step {}".format(self.global_env_step))
+                print("Question:   ", question_text)
+                print("LLM Answer: ", model_answer)
+                print("Gold Ans:   ", self.gold_answers if hasattr(self, 'gold_answers') else self.gold_answer)
+                print("="*60)
+
             # Calculate standard metrics against primary answer
             em = compute_exact_match(model_answer, self.gold_answer)
             f1 = compute_f1(model_answer, self.gold_answer)

@@ -16,6 +16,7 @@ from data.data_registry import CurriculumDataLoader, mixed_stream, get_dataset_i
 from curricula.length_schedule import LengthScheduleWrapper
 
 import logging
+import os
 logger = logging.getLogger(__name__)
 
 
@@ -110,10 +111,10 @@ def main(cfg: DictConfig):
             tokenizer=tokenizer,
             dataset_order=dataset_order,
             qa_thresholds=qa_thresholds,
-            split=cfg.data.split,
+            split="train",
             seed=cfg.train.seed,
             chunk_size=cfg.env.chunk_size,
-            dataset_config=cfg.data.get('dataset_config', None)
+            config=cfg  # Pass the full config object
         )
         
         # Get the iterator directly - not a function that returns an iterator
@@ -130,79 +131,44 @@ def main(cfg: DictConfig):
                 tokenizer=tokenizer,
                 split=cfg.data.split,
                 chunk_size=cfg.env.chunk_size,
-                seed=cfg.train.seed
+                seed=cfg.train.seed,
+                config=cfg
             )
     
-    # Create a separate validation data loader function
     # This will be called each time validation runs to get fresh data
     def get_validation_data():
-        logger.info("Creating validation data iterator")
-        # For validation, use a mix of validation data from all datasets
-        datasets = []
-        valid_dataset_names = []
-        
-        # First try to load each dataset and track which ones succeed
-        for name in cfg.data.datasets:
-            # Get dataset-specific config if available
-            dataset_config = {}
-            
-            # Apply dataset-specific configurations from the config file
-            if hasattr(cfg.data, 'dataset_config') and hasattr(cfg.data.dataset_config, name):
-                dataset_config = getattr(cfg.data.dataset_config, name)
-                logger.info(f"Using custom config for {name}: {dataset_config}")
-            
-            # Special case for TriviaQA - if it keeps failing, allow skipping it
-            if name == "triviaqa":
-                # Get skip_validation setting, defaulting to False
-                skip_validation = dataset_config.get('skip_validation', False) 
-                if skip_validation:
-                    logger.info(f"Skipping validation data for TriviaQA as configured")
-                    continue
-                
-            try:
-                # Use first 50 samples per dataset for validation
-                iterator = get_dataset_iterator(
-                    name, 
-                    tokenizer, 
-                    split="validation",
-                    chunk_size=cfg.env.chunk_size,
-                    **dataset_config  # Pass dataset-specific configs
-                )
-                # Test the iterator by getting one item
-                try:
-                    next(iterator)
-                    # If we get here, the iterator works
-                    datasets.append(iterator)
-                    valid_dataset_names.append(name)
-                    logger.info(f"Successfully loaded validation data for {name}")
-                except Exception as e:
-                    logger.warning(f"Failed to iterate validation data for {name}: {e}")
-            except Exception as e:
-                logger.warning(f"Failed to load validation data for {name}: {e}")
-        
-        if not datasets:
-            # Fallback to using just NarrativeQA for validation if nothing else works
-            logger.warning("No validation datasets could be loaded, falling back to NarrativeQA training data")
-            try:
-                iterator = get_dataset_iterator(
-                    "narrativeqa", 
-                    tokenizer, 
-                    split="train",  # Use training data as fallback
-                    chunk_size=cfg.env.chunk_size
-                )
-                datasets.append(iterator)
-                valid_dataset_names.append("narrativeqa")
-            except Exception as e:
-                raise ValueError(f"Failed to load fallback validation data: {e}")
-            
-        # Create a mixed stream for validation using only the datasets that work
-        logger.info(f"Using datasets for validation: {valid_dataset_names}")
-        return mixed_stream(
-            dataset_names=valid_dataset_names,  # Only use datasets that successfully loaded
-            tokenizer=tokenizer,
-            split="validation",
-            seed=cfg.eval.seed
-        )
+        """Loads validation data directly from the pre-processed cache directory."""
+        validation_cache_path = os.path.join(hydra.utils.get_original_cwd(), cfg.data.validation_cache_dir)
+        logger.info(f"Creating validation data iterator from cache: {validation_cache_path}")
+
+        try:
+            # Use the updated get_dataset_iterator, passing the directory path
+            # The tokenizer is technically not needed when loading from cache,
+            # but the function signature requires it.
+            validation_iterator = get_dataset_iterator(
+                dataset_name=validation_cache_path,
+                tokenizer=tokenizer, # Still needed for function signature
+                split="validation", # Not used for cache loading, but provide for consistency
+                chunk_size=cfg.env.chunk_size, # Not used for cache loading
+                config=cfg # Pass config in case it's needed by registry internals
+            )
+
+            # Basic check to ensure the iterator yields something
+            first_item = next(validation_iterator)
+            # We need to reconstruct the iterator after checking the first item
+            import itertools
+            validation_iterator = itertools.chain([first_item], validation_iterator)
+
+            logger.info("Successfully obtained validation iterator from cache.")
+            return validation_iterator
+
+        except StopIteration:
+            logger.error(f"Validation cache directory '{validation_cache_path}' exists but contains no valid data (.jsonl files might be empty or missing).")
+            raise ValueError(f"No data found in validation cache: {validation_cache_path}")
+        except Exception as e:
+            logger.error(f"Failed to load validation data from cache '{validation_cache_path}': {e}")
+            # Re-raise the exception as validation data is critical here
+            raise ValueError(f"Critical error loading validation data from cache: {e}")
 
     # 2) Create chunk length curriculum wrapper if requested
     chunk_curriculum_wrapper = None
@@ -401,8 +367,6 @@ def main(cfg: DictConfig):
     callbacks.append(global_step_callback)
     print("Using global step tracking for token reward annealing")
     
-
-
     model.learn(
         total_timesteps = cfg.train.total_steps,
         callback        = callbacks

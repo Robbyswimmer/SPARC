@@ -9,6 +9,8 @@ from typing import List, Dict, Any, Optional, Iterator, Callable
 from datasets import load_dataset
 from transformers import PreTrainedTokenizerFast
 import logging
+import os
+import pickle
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -63,7 +65,7 @@ def narrativeqa_adapter(
     try:
         # Load the dataset - note: the dataset ID is "narrativeqa" not "deepmind/narrativeqa"
         dataset = load_dataset("narrativeqa", split=split, streaming=streaming)
-        logger.info(f"Successfully loaded NarrativeQA dataset, split: {split}")
+        logger.debug(f"Successfully loaded NarrativeQA dataset, split: {split}")
     except Exception as e:
         logger.error(f"Failed to load NarrativeQA dataset: {e}")
         return
@@ -124,7 +126,7 @@ def hotpotqa_adapter(
 ) -> Iterator[Dict[str, Any]]:
     """Adapter for HotpotQA dataset."""
     if split == "validation":
-        logger.info(f"Attempting to load HotpotQA validation split...")
+        logger.debug(f"Attempting to load HotpotQA validation split...")
     try:
         dataset = load_dataset(
             "hotpot_qa", 
@@ -133,9 +135,9 @@ def hotpotqa_adapter(
             streaming=streaming,
             trust_remote_code=True
         )
-        logger.info(f"Successfully loaded HotpotQA dataset, split: {split}")
+        logger.debug(f"Successfully loaded HotpotQA dataset, split: {split}")
         if split == "validation":
-            logger.info(f"Successfully loaded HotpotQA validation split.")
+            logger.debug(f"Successfully loaded HotpotQA validation split.")
     except Exception as e:
         logger.error(f"Error loading HotpotQA (split={split}): {e}")
         return
@@ -262,7 +264,7 @@ def triviaqa_adapter(
     debug_max = 3  # Number of validation samples to print for debugging
         
     if split == "validation":
-        logger.info(f"Attempting to load TriviaQA validation split...")
+        logger.debug(f"Attempting to load TriviaQA validation split...")
     
     try:
         # For TriviaQA, we need to use the right split name
@@ -271,43 +273,30 @@ def triviaqa_adapter(
         if split == "validation":
             try:
                 dataset = load_dataset("trivia_qa", "rc", split="validation", streaming=streaming)
-                logger.info(f"Successfully loaded TriviaQA validation split.")
+                logger.debug(f"Successfully loaded TriviaQA validation split.")
             except Exception:
                 logger.warning(f"'validation' split not found for TriviaQA, trying 'dev' instead...")
                 try:
                     dataset = load_dataset("trivia_qa", "rc", split="dev", streaming=streaming)
-                    logger.info(f"Successfully loaded TriviaQA 'dev' split.")
+                    logger.debug(f"Successfully loaded TriviaQA 'dev' split.")
                     actual_split = "dev"
                 except Exception as e:
                     logger.error(f"Failed to load TriviaQA validation data with either 'validation' or 'dev' splits: {e}")
                     return
         else:
             dataset = load_dataset("trivia_qa", "rc", split=split, streaming=streaming)
-            logger.info(f"Successfully loaded TriviaQA dataset, split: {split}")
+            logger.debug(f"Successfully loaded TriviaQA dataset, split: {split}")
     except Exception as e:
         logger.error(f"Error loading TriviaQA (split={split}): {e}")
         return
     
     # Process dataset items
     for item in dataset:
-        # Print detailed debug info for the first few validation items
+        # Only log minimal info for validation items to reduce output noise
         if split == "validation" and debug_count < debug_max:
-            logger.info(f"------- TriviaQA Validation Item {debug_count+1}/{debug_max} -------")
-            logger.info(f"Item ID: {item.get('question_id', 'N/A')}")
-            logger.info(f"Item keys: {sorted(list(item.keys()))}")
-            
-            # Print selected important fields
-            for key in ['question', 'answer', 'search_results', 'entity_pages', 'evidence', 'aliases']:
-                if key in item:
-                    value = item[key]
-                    if isinstance(value, list) and len(value) > 0:
-                        logger.info(f"{key} (first element): {value[0]}")
-                        if isinstance(value[0], dict) and len(value[0]) > 0:
-                            logger.info(f"{key}[0] keys: {sorted(list(value[0].keys()))}")
-                    else:
-                        logger.info(f"{key}: {value}")
-                else:
-                    logger.info(f"{key}: <not found>")
+            # Simple log just noting we're processing an item
+            if 'question_id' in item and 'question' in item:
+                logger.debug(f"Processing TriviaQA validation item {item['question_id']}: {item['question'][:50]}...")
             debug_count += 1
         try:
             # Extract context based on document structure, with multiple fallback paths
@@ -385,7 +374,7 @@ def triviaqa_adapter(
                     
             # Log which path we ended up using for debugging
             if split == "validation" and debug_count <= debug_max:
-                logger.info(f"Context source path(s): {context_paths}")
+                logger.debug(f"Context source path(s) for {item.get('question_id', 'N/A')}: {context_paths}")
                     
             context = context_source # Use the context we found
 
@@ -447,7 +436,7 @@ def nq_adapter(
     """Adapter for Natural Questions dataset."""
     try:
         dataset = load_dataset("nq_open", split=split, streaming=streaming)
-        logger.info(f"Successfully loaded Natural Questions dataset, split: {split}")
+        logger.debug(f"Successfully loaded Natural Questions dataset, split: {split}")
     except Exception as e:
         logger.error(f"Error loading Natural Questions: {e}")
         return
@@ -512,53 +501,141 @@ def nq_adapter(
 DATASET_ADAPTERS = {
     "narrativeqa": narrativeqa_adapter,
     "hotpotqa": hotpotqa_adapter,
-    "triviaqa": triviaqa_adapter,
-    "nq_long": nq_adapter,
+    "triviaqa": triviaqa_adapter, # Corrected name
+    "nq_long": nq_adapter,  # Corrected name based on function definition
 }
 
-# Dataset configuration options
-DATASET_CONFIG = {
-    "narrativeqa": {
-        "use_summaries": True,  # Use summaries instead of full stories by default
-    },
-    "triviaqa": {
-        "skip_validation": False  # Option to skip TriviaQA validation data if it causes issues
-    }
-}
+# ================= Helper for Local Cache Loading =================
+
+def _load_from_local_cache(cache_dir: str) -> Iterator[Dict[str, Any]]:
+    """Loads pre-processed data from .pkl files in a local directory.
+
+    Assumes each .pkl file contains a list of dictionaries,
+    each matching the standard adapter output format.
+
+    Args:
+        cache_dir: Path to the directory containing .pkl cache files.
+
+    Yields:
+        Dict[str, Any]: Parsed data samples from the cache.
+    """
+    if not os.path.isdir(cache_dir):
+        logger.error(f"Local cache directory not found: {cache_dir}")
+        return
+
+    logger.info(f"Loading validation data from local PKL cache: {cache_dir}")
+    found_files = False
+    for filename in os.listdir(cache_dir):
+        if filename.endswith(".pkl"):
+            file_path = os.path.join(cache_dir, filename)
+            logger.debug(f"Reading cache file: {file_path}")
+            found_files = True
+            try:
+                with open(file_path, 'rb') as f: # Open in binary read mode
+                    data_list = pickle.load(f) # Load the entire object from the pickle file
+                    if isinstance(data_list, list):
+                        # Iterate through the loaded list
+                        for item in data_list:
+                            if isinstance(item, dict):
+                                yield item
+                            else:
+                                logger.warning(f"Skipping non-dict item in {filename}: {type(item)}")
+                    else:
+                        logger.warning(f"Skipping cache file {filename}: Expected a list, found {type(data_list)}")
+            except pickle.UnpicklingError as e:
+                 logger.error(f"Error unpickling cache file {filename}: {e}")
+            except Exception as e:
+                logger.error(f"Error reading cache file {filename}: {e}")
+
+    if not found_files:
+        logger.warning(f"No .pkl files found in cache directory: {cache_dir}")
+
+
+# ================= Data Loading Functions =================
+
+def get_dataset_iterator(
+    dataset_name: str,
+    tokenizer: PreTrainedTokenizerFast,
+    split: str = "train",
+    chunk_size: int = 256,
+    config: Optional[Dict[str, Any]] = None
+) -> Iterator[Dict[str, Any]]:
+    """Get iterator for a specific dataset using its adapter or load from local cache.
+
+    If `dataset_name` looks like a directory path, it attempts to load
+    pre-processed data from .pkl files within that directory.
+    Otherwise, it treats `dataset_name` as a HuggingFace dataset identifier.
+
+    Args:
+        dataset_name: Name of the dataset or path to a local cache directory.
+        tokenizer: Tokenizer for processing text (used only for HF loading).
+        split: Dataset split to use (used only for HF loading).
+        chunk_size: Size of document chunks (used only for HF loading).
+        config: Optional configuration dictionary, potentially containing dataset-specific settings.
+
+    Returns:
+        Iterator yielding dataset examples in standardized dictionary format.
+
+    Raises:
+        ValueError: If the dataset name is not recognized and not a valid path,
+                    or if the corresponding adapter function is not found.
+    """
+    # Check if dataset_name is a local path
+    if os.path.isdir(dataset_name): # More robust check than just looking for '/'
+        # Load directly from the local cache directory
+        return _load_from_local_cache(dataset_name) # Use the renamed function
+
+    # --- Proceed with Hugging Face loading if not a local path ---
+    logger.info(f"Attempting to load dataset '{dataset_name}' from HuggingFace Hub (split: {split})...")
+
+    # Get dataset-specific config if available within the main config
+    dataset_cfg = {}
+    if config and hasattr(config.data, 'dataset_config') and hasattr(config.data.dataset_config, dataset_name):
+        # Convert OmegaConf DictConfig to standard Python dict if necessary
+        from omegaconf import OmegaConf
+        ds_specific_conf = getattr(config.data.dataset_config, dataset_name)
+        if isinstance(ds_specific_conf, OmegaConf):
+            dataset_cfg = OmegaConf.to_container(ds_specific_conf, resolve=True)
+        else:
+            dataset_cfg = dict(ds_specific_conf) if not isinstance(ds_specific_conf, dict) else ds_specific_conf
+        logger.info(f"Using specific config for {dataset_name}: {dataset_cfg}")
+
+    # Ensure dataset_cfg is a plain dict so we can add keys
+    if not isinstance(dataset_cfg, dict):
+        dataset_cfg = dict(dataset_cfg)
+
+    # Add chunk_size and split to the specific config for the adapter
+    dataset_cfg['chunk_size'] = chunk_size
+    dataset_cfg['split'] = split
+
+    # Check if adapter exists
+    if dataset_name not in DATASET_ADAPTERS:
+        raise ValueError(f"Unknown dataset or adapter not found: {dataset_name}")
+
+    adapter_func = DATASET_ADAPTERS[dataset_name]
+
+    # Call the adapter function with necessary arguments + specific config
+    try:
+        # Pass tokenizer and specific config kwargs to the adapter
+        # The adapter itself will handle streaming=True if needed
+        logger.debug(f"Calling adapter {adapter_func.__name__} with config: {dataset_cfg}")
+        return adapter_func(tokenizer=tokenizer, **dataset_cfg)
+    except Exception as e:
+        logger.error(f"Adapter function for '{dataset_name}' failed: {e}")
+        raise  # Re-raise the exception after logging
+
+# Dataset-specific configurations will come from the config.yaml file
+# This is kept for backward compatibility but will be deprecated
+DATASET_CONFIG = {}
 
 # ================= Mixed Dataset Streaming =================
-
-def get_dataset_iterator(dataset_name: str, tokenizer: PreTrainedTokenizerFast, split: str = "train", chunk_size: int = 256) -> Iterator:
-    """Get iterator for a specific dataset using its adapter.
-    
-    Args:
-        dataset_name: Name of the dataset to load
-        tokenizer: Tokenizer for processing text
-        split: Dataset split to use
-        
-    Returns:
-        Iterator yielding dataset examples in standardized dictionary format
-    """
-    adapter = DATASET_ADAPTERS.get(dataset_name)
-    if not adapter:
-        raise ValueError(f"No adapter available for dataset: {dataset_name}")
-    
-    # Get dataset-specific config options
-    config = DATASET_CONFIG.get(dataset_name, {})
-    
-    # Call the adapter with appropriate parameters
-    if dataset_name == "narrativeqa":
-        # Use config option for use_summaries with default fallback
-        use_summaries = config.get("use_summaries", True)
-        return adapter(tokenizer, split=split, use_summaries=use_summaries, chunk_size=chunk_size)
-    else:
-        return adapter(tokenizer, split=split, chunk_size=chunk_size)
 
 def mixed_stream(dataset_names: List[str], 
                  tokenizer: PreTrainedTokenizerFast, 
                  split: str = "train",
                  chunk_size: int = 256,
-                 seed: Optional[int] = None) -> Iterator[Dict[str, Any]]:
+                 seed: Optional[int] = None,
+                 config: Optional[Dict[str, Any]] = None) -> Iterator[Dict[str, Any]]:
     """Stream a mix of datasets with uniform random sampling.
     
     Args:
@@ -581,7 +658,7 @@ def mixed_stream(dataset_names: List[str],
     dataset_errors = {}
     for name in dataset_names:
         try:
-            iterators[name] = get_dataset_iterator(name, tokenizer, split, chunk_size)
+            iterators[name] = get_dataset_iterator(name, tokenizer, split, chunk_size, config)
         except Exception as e:
             error_msg = str(e)
             dataset_errors[name] = error_msg
@@ -604,9 +681,9 @@ def mixed_stream(dataset_names: List[str],
             yield next(iterators[dataset_name])
         except StopIteration:
             # Reinitialize the iterator if it's exhausted
-            logger.info(f"Reinitializing iterator for {dataset_name}")
+            logger.debug(f"Reinitializing iterator for {dataset_name}")
             try:
-                iterators[dataset_name] = get_dataset_iterator(dataset_name, tokenizer, split, chunk_size)
+                iterators[dataset_name] = get_dataset_iterator(dataset_name, tokenizer, split, chunk_size, config)
                 yield next(iterators[dataset_name])
             except Exception as e:
                 error_msg = str(e)
@@ -744,7 +821,8 @@ class CurriculumDataLoader:
                  seed: Optional[int] = None,
                  regress_ok: bool = True,
                  chunk_size: int = 256,
-                 dataset_config: Dict[str, Dict[str, Any]] = None):
+                 dataset_config: Dict[str, Dict[str, Any]] = None,
+                 config: Optional[Dict[str, Any]] = None):
         """Initialize curriculum data loader.
         
         Args:
@@ -768,30 +846,27 @@ class CurriculumDataLoader:
         self.seed = seed
         self.regress_ok = regress_ok
         self.chunk_size = chunk_size
+        self.config = config
         
-        # Update global dataset config with user-provided overrides
-        if dataset_config:
-            for dataset_name, config in dataset_config.items():
-                if dataset_name in DATASET_CONFIG:
-                    DATASET_CONFIG[dataset_name].update(config)
-                else:
-                    DATASET_CONFIG[dataset_name] = config
+        # Keep legacy dataset_config support for backward compatibility
+        self.dataset_config = dataset_config
         
         # Start with just the first (easiest) dataset
         self.active_datasets = [dataset_order[0]]
         self.current_level = 0
         self.current_iterator = self._create_iterator()
         
-        logger.info(f"Curriculum initialized with dataset: {self.active_datasets[0]}")
+        logger.debug(f"Curriculum initialized with dataset: {self.active_datasets[0]}")
     
-    def _create_iterator(self) -> Iterator:
+    def _create_iterator(self):
         """Create a mixed stream iterator with current active datasets."""
         return mixed_stream(
-            self.active_datasets, 
-            self.tokenizer, 
-            self.split, 
+            dataset_names=self.active_datasets,
+            tokenizer=self.tokenizer,
+            split=self.split,
             chunk_size=self.chunk_size,
-            seed=self.seed
+            seed=self.seed,
+            config=self.config
         )
     
     def update_curriculum(self, qa_score: float) -> bool:

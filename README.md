@@ -37,9 +37,9 @@ End-to-end train/evaluate scripts and WandB logging
 
 # 🧪 Quickstart
 
-python src/scripts/example_demo.py   # random agent demo
-python src/scripts/train.py          # PPO training loop
-python src/scripts/evaluate.py       # accuracy, EM, token usage
+python src/scripts/example_demo.py   --> random agent demo
+python src/scripts/train.py          --> PPO training loop
+python src/scripts/evaluate.py       --> accuracy, EM, token usage
 
 # 🧠 Key Concepts
 

@@ -10,9 +10,9 @@ The desired outcome from utilizing SPARC is savings in terms of compute time and
 
 # Features
 
--- RL environment StreamingQAGym based on Gymnasium
+- RL environment StreamingQAGym based on Gymnasium
 
--- Support for KEEP, DROP, and (soon) COMPRESS actions
+- Support for KEEP, DROP, and (soon) COMPRESS actions
 
 -- PPO-based training with Stable-Baselines3
 

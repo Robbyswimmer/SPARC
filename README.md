@@ -26,20 +26,6 @@ Lightweight summariser for COMPRESS action (WIP)
 
 End-to-end train/evaluate scripts and WandB logging
 
-📁 Project Structure
-
-SPARC/
-├── src/
-│   ├── envs/              # streaming_qagym.py
-│   ├── agents/            # PPO policy + summariser
-│   ├── utils/             # reward, tokenizer, LLM interface
-│   └── scripts/           # train.py, evaluate.py, demo
-├── tests/                 # unit tests
-├── data/                  # streamed HF datasets
-├── environment.yml        # conda environment file
-├── requirements.txt       # pip fallback
-└── README.md
-
 ⚙️ Setup
 
 # Clone and activate conda environment
@@ -47,7 +33,7 @@ SPARC/
 - conda activate streamqa
 - pip install -r requirements.txt
 
-Optional: install llama-cpp-python for quantized LLM inference
+Install llama-cpp-python for quantized LLM inference
 - brew install cmake
 - CMAKE_ARGS="-DLLAMA_METAL=on" pip install llama-cpp-python
 
@@ -59,11 +45,9 @@ python src/scripts/evaluate.py       # accuracy, EM, token usage
 
 🧠 Key Concepts
 
-Observation: CLS embeddings + remaining budget + chunk index
-
 Actions: {0: DROP, 1: KEEP, 2: COMPRESS (WIP)}
 
-Reward: QA_EM + QA_F1 − token_penalty − step_penalty − compress_penalty
+Reward: QA_EM + QA_F1 − token_penalty − step_penalty
 
 Policy: 3-layer Transformer (<12M params)
 
@@ -84,5 +68,3 @@ MIT License. See LICENSE file for details.
 🤝 Contributing
 
 We welcome PRs that improve training stability, extend evaluation tasks, or add summarisation capabilities. Please lint and test your code and follow the contribution guidelines in .windsurfrules.
-
-🧭 Roadmap

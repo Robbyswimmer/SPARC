@@ -1,5 +1,4 @@
-# SPARC
-## Streaming Pruning And Retention Controller
+# SPARC: Streaming Pruning And Retention Controller
 
 SPARC is a lightweight reinforcement learning (RL) framework for dynamic, token-budgeted context management in frozen large language models (LLMs). Instead of using static heuristics like sliding windows or TF-IDF filtering, SPARC learns to decide in real time which incoming document chunks to KEEP, COMPRESS, or DROP, optimizing for downstream task accuracy under a fixed context window constraint.
 

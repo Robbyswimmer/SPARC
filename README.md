@@ -14,17 +14,17 @@ The desired outcome from utilizing SPARC is savings in terms of compute time and
 
 - Support for KEEP, DROP, and (soon) COMPRESS actions
 
--- PPO-based training with Stable-Baselines3
+- PPO-based training with Stable-Baselines3
 
--- Pluggable reward function combining QA accuracy (EM + F1) and token cost
+- Pluggable reward function combining QA accuracy (EM + F1) and token cost
 
-Frozen LLM inference via llama-cpp-python with 4-bit GGUF models
+- Frozen LLM inference via llama-cpp-python with 4-bit GGUF models
 
-Fully streamable HF datasets (e.g., NarrativeQA, HotpotQA)
+- Fully streamable HF datasets (e.g., NarrativeQA, HotpotQA)
 
-Lightweight summariser for COMPRESS action (WIP)
+- Lightweight summariser for COMPRESS action (WIP)
 
-End-to-end train/evaluate scripts and WandB logging
+- End-to-end train/evaluate scripts and WandB logging
 
 # Setup
 

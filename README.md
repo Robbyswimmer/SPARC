@@ -6,15 +6,17 @@ SPARC is a lightweight reinforcement learning (RL) framework for dynamic, token-
 
 LLMs are increasingly used in streaming applications—code assistants, document QA systems, live meeting agents—but are limited by their context window (e.g., 2K-8K tokens). Most current systems use simple heuristics that fail to adapt based on content relevance or task reward. SPARC introduces a trained policy that performs real-time memory management based on context utility and budget trade-offs.
 
+The desired outcome from utilizing SPARC is savings in terms of compute time and runtime costs associated with LLMs. Current calculations suggest that reducing total prompt tokens in medium sized models by even 1% could yield savings. Early experiments have suggested SPARC can achieve better results than this and the goal is to reduce prompt size by 20-30% so that even smaller models can benefit from SPARC implementations in their pipelines.
+
 # Features
 
-RL environment StreamingQAGym based on Gymnasium
+-- RL environment StreamingQAGym based on Gymnasium
 
-Support for KEEP, DROP, and (soon) COMPRESS actions
+-- Support for KEEP, DROP, and (soon) COMPRESS actions
 
-PPO-based training with Stable-Baselines3
+-- PPO-based training with Stable-Baselines3
 
-Pluggable reward function combining QA accuracy (EM + F1) and token cost
+-- Pluggable reward function combining QA accuracy (EM + F1) and token cost
 
 Frozen LLM inference via llama-cpp-python with 4-bit GGUF models
 

@@ -2,39 +2,41 @@ exp:
   name: sparc_ppo_longctx
 data:
   datasets: [narrativeqa, hotpotqa, triviaqa, nq_long]  # All available datasets
-  dataset_order: [narrativeqa, hotpotqa, triviaqa, nq_long]  # From easiest to hardest
+  dataset_order: [narrativeqa, nq_long, triviaqa, hotpotqa]  # From easiest to hardest
   validation_cache_dir: "data/validation_cache" # Relative path to validation cache
   curriculum_enabled: true  # Enable dataset curriculum
-  qa_thresholds: [0.3, 0.4, 0.5]  # QA score thresholds to unlock next dataset
+  qa_thresholds: [0.15, 0.20, 0.25]  # QA score thresholds to unlock next dataset, optimized for 3b reader
   split: train
   dataset_config:  # Dataset-specific configuration
     narrativeqa:
       use_summaries: true  # Use summaries instead of full stories for NarrativeQA
     triviaqa:
       skip_validation: false      # Option to skip TriviaQA validation data if it causes issues
-      use_synthetic_fallback: true # Generate synthetic context when real context isn't found
+      use_synthetic_fallback: false # Generate synthetic context when real context isn't found
       include_aliases: true       # Include alias information in context when available
       debug_context_paths: false  # Print detailed context extraction paths for debugging
     nq_long:
-      use_synthetic_context: true # If True, creates synthetic context from question+answers
-      max_context_length: 1024    # Maximum context length to use when real context is available
+      use_synthetic_context: false # If True, creates synthetic context from question+answers
+      max_context_length: 4096    # Maximum context length to use when real context is available
       context_padding: true       # Add generic padding to short contexts to make task more realistic
 env:
   chunk_size: 256
-  max_window: 2048
+  max_window: 8192
   reward:
-    alpha: 1.0            # Weight for QA score
-    beta_keep: -0.01    # Cost per token KEPT in context window
+    alpha: 0.010         # Weight for QA score
+    beta_keep: -0.03   # Cost per token KEPT in context window
     beta_compress: -0.05 # Cost per token in COMPRESSED chunk (if applicable)
-    gamma_step: -0.01   # Flat cost applied per step, regardless of action
+    gamma_step: 0.02   # Flat cost applied per step, regardless of action
+    kappa: 0.15        # Hindsight credit fraction (κ) - portion of QA reward to distribute
+    use_hindsight: true # Whether to use hindsight credit mechanism
 curriculum:
   enabled: true
-  start_chunks: 2
-  max_chunks: 10
-  growth_steps: 50_000
+  start_chunks: 12
+  max_chunks: 20
+  growth_steps: 50000
 model:
   tokenizer: NousResearch/Meta-Llama-3.1-8B
-  embed_dim: 128
+  embed_dim: 256
   vocab_size: 128256
   net_arch: [{pi: [128, 64], vf: [128, 64]}]
 train:
@@ -45,13 +47,16 @@ train:
   batch_size: 256
   gamma: 0.99
   seed: 42  # Random seed for training
-  gae_lambda: 0.95
-  clip_range: 0.2
+  gae_lambda: 0.92
+  clip_range: 0.20
 wandb:
   project: SPARC
+  entity: "robbyswimmer" # Your W&B entity (username or team)
+  mode: "online" # "online", "offline", or "disabled"
+  log_hindsight_bonus_steps: 2000 # Number of global steps to log hindsight_bonus_pkc for histogram
 eval:
-  frequency: 100   # Evaluate every 10k steps
-  episodes: 1      # Number of episodes to evaluate on
+  frequency: 6000   # Evaluate every 10k steps
+  episodes: 30      # Number of episodes to evaluate on
   deterministic: true
   save_path: "./checkpoints/" # Directory to save best model checkpoints
   seed: 123  # Random seed for evaluation

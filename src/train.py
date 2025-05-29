@@ -7,7 +7,7 @@ from stable_baselines3.common.callbacks import BaseCallback
 from transformers import AutoTokenizer
 
 from envs.streaming_qagym import StreamingQAGym
-from agents.ppo_agent import TokenEmbedExtractor, WandbCallback
+from agents.ppo_agent import TokenEmbedExtractor, WandbCallback, HindsightRewardCallback
 from agents.entropy_schedule import EntropyScheduleCallback
 from agents.global_step_callback import GlobalStepCallback
 from agents.eval_callback import ValidationCallback
@@ -136,8 +136,9 @@ def main(cfg: DictConfig):
             )
     
     # This will be called each time validation runs to get fresh data
-    def get_validation_data():
-        """Loads validation data directly from the pre-processed cache directory."""
+    def get_validation_data(seed=None):
+        """Loads validation data directly from the pre-processed cache directory.
+        Accepts an optional seed argument for compatibility; it is ignored."""
         validation_cache_path = os.path.join(hydra.utils.get_original_cwd(), cfg.data.validation_cache_dir)
         logger.info(f"Creating validation data iterator from cache: {validation_cache_path}")
 
@@ -232,8 +233,12 @@ def main(cfg: DictConfig):
                 chunk_size   = cfg.env.chunk_size,
                 max_window   = cfg.env.max_window,
                 data_loader_fn = state_refs['train_data_fn'],
-                gamma_step = cfg.env.get('gamma_step', 0.0), # Load gamma_step from config
-                seed         = seed,
+                alpha = cfg.env.reward.alpha,
+                beta_keep = cfg.env.reward.beta_keep,
+                gamma_step = cfg.env.reward.gamma_step,
+                kappa = cfg.env.reward.kappa, # Pass hindsight credit fraction
+                use_hindsight = cfg.env.reward.get('use_hindsight', True), # Pass use_hindsight
+                seed = seed,
             )
             # If using wrapped loader_fn approach for dataset+chunk curriculum, 
             # store reference to the wrapper for the callback
@@ -261,7 +266,7 @@ def main(cfg: DictConfig):
     )
 
     model = PPO(
-        "MlpPolicy",
+        "MultiInputPolicy",
         vec_env,
         learning_rate = cfg.train.lr,
         n_steps       = cfg.train.n_steps,
@@ -269,18 +274,38 @@ def main(cfg: DictConfig):
         gamma         = cfg.train.gamma,
         gae_lambda    = cfg.train.gae_lambda,
         clip_range    = cfg.train.clip_range,
-        ent_coef      = 0.05,  # Start with high entropy for exploration
+        ent_coef      = 0.02,  # Start with high entropy for exploration
         policy_kwargs = policy_kwargs,
         tensorboard_log = "./runs/tb",
         device          = "auto",
     )
 
+    # === Checkpoint loading logic ===
+    checkpoint_path = "checkpoints/sparc_best_model_05_08_25.zip"
+    if os.path.exists(checkpoint_path):
+        print(f"Loading checkpoint from {checkpoint_path}")
+        model.set_parameters(checkpoint_path)
+    else:
+        print(f"No checkpoint found at {checkpoint_path}, training from scratch.")
+
     run_name = f"{cfg.exp.name}-{wandb.util.generate_id()}"
     # Setup callbacks
     callbacks = [
-        WandbCallback(project=cfg.wandb.project, run_name=run_name),
-        RenderCallback(render_freq=100)  # Render visualization every 100 steps
+        GlobalStepCallback(), 
+        WandbCallback(
+            project=cfg.wandb.project, 
+            run_name=run_name, 
+            config=cfg,
+            log_hindsight_bonus_steps=cfg.wandb.get('log_hindsight_bonus_steps', 2000) # Pass new param
+            ),
     ]
+    
+    # Conditionally add HindsightRewardCallback
+    if cfg.env.reward.get('use_hindsight', True):
+        callbacks.append(HindsightRewardCallback(verbose=1))
+        logger.info("Hindsight Reward Callback ENABLED.")
+    else:
+        logger.info("Hindsight Reward Callback DISABLED.")
     
     # Add chunk length curriculum callback if enabled
     if cfg.curriculum.enabled and state_refs['chunk_curriculum_wrapper'] is not None:
@@ -353,7 +378,7 @@ def main(cfg: DictConfig):
     
     # Add entropy schedule callback to linearly decay entropy coefficient
     entropy_callback = EntropyScheduleCallback(
-        start_coef=0.05,
+        start_coef=0.07,
         end_coef=0.0,
         decay_fraction=0.5,  # Decay over first half of training
         total_timesteps=cfg.train.total_steps,

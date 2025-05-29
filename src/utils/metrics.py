@@ -20,7 +20,11 @@ def compute_em(gold: str, pred: str) -> float:
     """
     Exact Match: 1.0 if gold == pred after normalization, else 0.0
     """
-    return float(normalize_text(gold) == normalize_text(pred))
+    norm_gold = normalize_text(gold)
+    norm_pred = normalize_text(pred)
+    # print(f"[compute_em] norm_gold: {norm_gold}")
+    # print(f"[compute_em] norm_pred: {norm_pred}")
+    return float(norm_gold == norm_pred)
 
 def compute_exact_match(pred: str, gold: str) -> float:
     """
@@ -35,6 +39,8 @@ def compute_f1(gold: str, pred: str) -> float:
     """
     gold_tokens = normalize_text(gold)
     pred_tokens = normalize_text(pred)
+    # print(f"[compute_f1] gold_tokens: {gold_tokens}")
+    # print(f"[compute_f1] pred_tokens: {pred_tokens}")
 
     if not gold_tokens or not pred_tokens:
         return 0.0

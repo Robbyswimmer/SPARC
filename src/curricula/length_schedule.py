@@ -34,6 +34,7 @@ class LengthScheduleWrapper(Iterator[Dict[str, Any]]):
         self.total_schedule_steps = total_schedule_steps
         self.min_chunks = max(1, min_chunks) # Ensure at least 1 chunk
         self._current_step = 0 # Tracks how many times __next__ has been called
+        self._last_reported_max_chunks = self.initial_max_chunks
 
     def __iter__(self) -> Iterator[Dict[str, Any]]:
         return self
@@ -69,8 +70,11 @@ class LengthScheduleWrapper(Iterator[Dict[str, Any]]):
         answers = example["answers"]
         meta = example.get("meta", {})
 
-        # Calculate the max chunks allowed for this step
+        # Curriculum progression: check if max chunks increased
         current_max_chunks = self._calculate_current_max_chunks()
+        if current_max_chunks > self._last_reported_max_chunks:
+            print(f"[Curriculum] Max chunks increased: {self._last_reported_max_chunks} -> {current_max_chunks} at step {self._current_step}")
+            self._last_reported_max_chunks = current_max_chunks
 
         # Check if doc_chunks is a list and handle accordingly
         if isinstance(doc_chunks, list):

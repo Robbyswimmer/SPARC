@@ -11,6 +11,7 @@ from transformers import PreTrainedTokenizerFast
 import logging
 import os
 import pickle
+import time
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -172,36 +173,55 @@ def hotpotqa_adapter(
                       context_list = raw_context.get("sentences", [])
             elif isinstance(raw_context, list): # Handle if context is just a list
                  context_list = raw_context
-
-
-            if not isinstance(context_list, list) or not context_list: # Check if it's a non-empty list now
-                 logger.warning(f"Skipping HotpotQA sample {item.get('id', 'N/A')} due to empty or non-list context data after extraction attempts.")
-                 continue
-
-            # --- Build context string safely ---
-            context = ""
-            # Assuming context_list now contains the actual text paragraphs/sentences
-            # We might need to refine this based on the debug output
+            supporting_facts = item.get("supporting_facts", [])
+            # Always default to empty list, do not skip samples for missing/invalid supporting_facts
+            support_titles = [sf[0] for sf in supporting_facts[:2]] if supporting_facts and isinstance(supporting_facts, list) and len(supporting_facts) >= 2 else []
             titles = raw_context.get("title", []) if isinstance(raw_context, dict) else []
-
-            # If titles exist and match the length of paragraphs/sentences list
-            if titles and len(titles) == len(context_list):
-                 for title, sentences in zip(titles, context_list):
-                      if isinstance(sentences, list) and sentences:
-                          context += f"Title: {title}\n"
-                          for sent in sentences:
-                              context += f"{sent}\n"
-                      elif isinstance(sentences, str): # Handle if elements are strings directly
-                           context += f"Title: {title}\n{sentences}\n"
-            else:
-                 # Fallback: Concatenate all strings found in the list
-                 for element in context_list:
-                      if isinstance(element, list): # If nested list of sentences
-                          for sent in element:
-                              if isinstance(sent, str):
-                                  context += f"{sent}\n"
-                      elif isinstance(element, str): # If just a list of strings
-                          context += f"{element}\n"
+            para_dict = dict(zip(titles, context_list)) if titles and len(titles) == len(context_list) else {}
+            selected_paras = []
+            # (a) Try supporting_facts→title match
+            if support_titles:
+                for t in support_titles:
+                    if t in para_dict:
+                        selected_paras.append(para_dict[t])
+            # (b) If not enough, try TF-IDF/keyword match against answers
+            if len(selected_paras) < 2 and context_list and item.get("answers"):
+                # Simple TF-IDF: score by answer word overlap (case-insensitive)
+                answers = item["answers"]
+                answer_words = set()
+                for ans in answers:
+                    answer_words.update(ans.lower().split())
+                para_scores = []
+                for para in context_list:
+                    if isinstance(para, list):
+                        para_text = " ".join(para)
+                    else:
+                        para_text = str(para)
+                    para_words = set(para_text.lower().split())
+                    overlap = len(answer_words & para_words)
+                    para_scores.append(overlap)
+                # Pick top 2 scoring paragraphs (break ties by order)
+                best_idx = np.argsort(para_scores)[::-1][:2]
+                for idx in best_idx:
+                    if context_list[idx] not in selected_paras:
+                        selected_paras.append(context_list[idx])
+                # Truncate to 2
+                selected_paras = selected_paras[:2]
+            # Fallback: first two paragraphs by order
+            if not selected_paras and len(context_list) >= 2:
+                selected_paras = context_list[:2]
+            elif not selected_paras and len(context_list) == 1:
+                selected_paras = [context_list[0]]
+            if not selected_paras:
+                logger.warning(f"Skipping HotpotQA sample {item.get('id', 'N/A')} because could not find any paragraphs for context.")
+                continue
+            # Flatten to text
+            context = ""
+            for para in selected_paras:
+                if isinstance(para, list):
+                    context += " ".join(para) + "\n"
+                elif isinstance(para, str):
+                    context += para + "\n"
 
             # ... (rest of the adapter: check context, question, answer, tokenize, chunk, yield) ...
             if not context: # Check if context string ended up empty
@@ -306,11 +326,20 @@ def triviaqa_adapter(
             
             # Try search_results path first (common in training data)
             search_results = item.get("search_results")
-            if search_results and isinstance(search_results, list) and len(search_results) > 0:
-                first_result = search_results[0]
-                if isinstance(first_result, dict) and "search_context" in first_result:
-                    context_source = first_result.get("search_context")
-                    context_paths.append("search_results[0].search_context")
+            if search_results:
+                # Handle both list-of-dicts and dict-of-lists
+                if isinstance(search_results, list) and len(search_results) > 0:
+                    first_result = search_results[0]
+                    if isinstance(first_result, dict) and "search_context" in first_result:
+                        context_source = first_result.get("search_context")
+                        context_paths.append("search_results[0].search_context")
+                elif isinstance(search_results, dict):
+                    # HF streaming split: dict of lists, e.g. {"search_context": [str, str, ...], ...}
+                    for key, val in search_results.items():
+                        if key == "search_context" and isinstance(val, list) and len(val) > 0:
+                            context_source = val[0]
+                            context_paths.append("search_results['search_context'][0]")
+                            break
             
             # Try evidence path (common in validation data)
             evidence = item.get("evidence")
@@ -457,13 +486,8 @@ def nq_adapter(
             # NQ has multiple answers
             answers = item["answer"]
             
-            # For NQ, we'll need to use a simplified context since full document may not be available
-            # in the open version - generate synthetic context using answers and question
-            context = f"The question '{question}' has the following information:\n"
-            
-            for i, answer in enumerate(answers):
-                context += f"Answer {i+1}: {answer}\n"
-                
+            # For NQ, use only the question and generic context (do NOT include answers in context)
+            context = f"The question '{question}' has the following information.\n"
             # Add some generic context padding to make it more challenging
             context += "The above information is part of a knowledge base that contains facts about various topics."
             
@@ -507,6 +531,33 @@ DATASET_ADAPTERS = {
 
 # ================= Helper for Local Cache Loading =================
 
+def _save_to_cache(cache_dir: str, samples: List[Dict[str, Any]], max_samples: int = 1000) -> None:
+    """Save processed data samples to a cache file.
+    
+    Args:
+        cache_dir: Directory to save the cache file
+        samples: List of processed data samples to cache
+        max_samples: Maximum number of samples per cache file
+    """
+    if not samples:
+        logger.warning("No samples to cache")
+        return
+        
+    os.makedirs(cache_dir, exist_ok=True)
+    
+    # Create a unique filename based on timestamp
+    timestamp = int(time.time())
+    cache_file = os.path.join(cache_dir, f"cache_{timestamp}.pkl")
+    
+    logger.info(f"Saving {len(samples)} processed samples to cache: {cache_file}")
+    try:
+        with open(cache_file, 'wb') as f:
+            pickle.dump(samples, f)
+        logger.info(f"Successfully cached samples to {cache_file}")
+    except Exception as e:
+        logger.error(f"Error saving to cache file {cache_file}: {e}")
+
+
 def _load_from_local_cache(cache_dir: str) -> Iterator[Dict[str, Any]]:
     """Loads pre-processed data from .pkl files in a local directory.
 
@@ -521,10 +572,13 @@ def _load_from_local_cache(cache_dir: str) -> Iterator[Dict[str, Any]]:
     """
     if not os.path.isdir(cache_dir):
         logger.error(f"Local cache directory not found: {cache_dir}")
+        yield from []  # Use yield from to return an empty iterator
         return
 
     logger.info(f"Loading validation data from local PKL cache: {cache_dir}")
     found_files = False
+    samples = []  # Collect all samples first
+    
     for filename in os.listdir(cache_dir):
         if filename.endswith(".pkl"):
             file_path = os.path.join(cache_dir, filename)
@@ -534,12 +588,8 @@ def _load_from_local_cache(cache_dir: str) -> Iterator[Dict[str, Any]]:
                 with open(file_path, 'rb') as f: # Open in binary read mode
                     data_list = pickle.load(f) # Load the entire object from the pickle file
                     if isinstance(data_list, list):
-                        # Iterate through the loaded list
-                        for item in data_list:
-                            if isinstance(item, dict):
-                                yield item
-                            else:
-                                logger.warning(f"Skipping non-dict item in {filename}: {type(item)}")
+                        # Add all valid samples to our collection
+                        samples.extend([item for item in data_list if isinstance(item, dict)])
                     else:
                         logger.warning(f"Skipping cache file {filename}: Expected a list, found {type(data_list)}")
             except pickle.UnpicklingError as e:
@@ -549,7 +599,18 @@ def _load_from_local_cache(cache_dir: str) -> Iterator[Dict[str, Any]]:
 
     if not found_files:
         logger.warning(f"No .pkl files found in cache directory: {cache_dir}")
-
+        yield from []  # Use yield from to return an empty iterator
+        return
+    
+    if not samples:
+        logger.warning(f"No valid samples found in cache files in: {cache_dir}")
+        yield from []  # Use yield from to return an empty iterator
+        return
+    
+    logger.info(f"Successfully loaded {len(samples)} samples from cache")
+    # Now yield all collected samples
+    for sample in samples:
+        yield sample
 
 # ================= Data Loading Functions =================
 
@@ -580,49 +641,113 @@ def get_dataset_iterator(
         ValueError: If the dataset name is not recognized and not a valid path,
                     or if the corresponding adapter function is not found.
     """
-    # Check if dataset_name is a local path
-    if os.path.isdir(dataset_name): # More robust check than just looking for '/'
-        # Load directly from the local cache directory
-        return _load_from_local_cache(dataset_name) # Use the renamed function
-
-    # --- Proceed with Hugging Face loading if not a local path ---
-    logger.info(f"Attempting to load dataset '{dataset_name}' from HuggingFace Hub (split: {split})...")
-
-    # Get dataset-specific config if available within the main config
-    dataset_cfg = {}
-    if config and hasattr(config.data, 'dataset_config') and hasattr(config.data.dataset_config, dataset_name):
-        # Convert OmegaConf DictConfig to standard Python dict if necessary
-        from omegaconf import OmegaConf
-        ds_specific_conf = getattr(config.data.dataset_config, dataset_name)
-        if isinstance(ds_specific_conf, OmegaConf):
-            dataset_cfg = OmegaConf.to_container(ds_specific_conf, resolve=True)
+    # First check for validation cache path in config
+    if config and "validation_cache_path" in config and config["validation_cache_path"]:
+        cache_path = config["validation_cache_path"]
+        if os.path.isdir(cache_path):
+            # Check if there are actual .pkl files in the cache directory
+            pkl_files = [f for f in os.listdir(cache_path) if f.endswith('.pkl')]
+            if pkl_files:  # Only use cache if it actually contains data
+                it = _load_from_local_cache(cache_path)
+                return it
+    
+    # Check if dataset_name itself is a local path
+    if os.path.isdir(dataset_name):
+        # Check if there are actual .pkl files in the directory
+        pkl_files = [f for f in os.listdir(dataset_name) if f.endswith('.pkl')]
+        if pkl_files:
+            it = _load_from_local_cache(dataset_name)
+            return it
         else:
-            dataset_cfg = dict(ds_specific_conf) if not isinstance(ds_specific_conf, dict) else ds_specific_conf
-        logger.info(f"Using specific config for {dataset_name}: {dataset_cfg}")
+            logger.info(f"Directory exists but contains no .pkl files: {dataset_name}")
 
-    # Ensure dataset_cfg is a plain dict so we can add keys
-    if not isinstance(dataset_cfg, dict):
+    dataset_cfg = None
+    if config:
+        # OmegaConf style
+        if hasattr(config, "data") and hasattr(config.data, "dataset_config") and hasattr(config.data.dataset_config, dataset_name):
+            dataset_cfg = getattr(config.data.dataset_config, dataset_name)
+        # dict style
+        elif isinstance(config, dict) and "dataset_config" in config and dataset_name in config["dataset_config"]:
+            dataset_cfg = config["dataset_config"][dataset_name]
+    if dataset_cfg is not None and not isinstance(dataset_cfg, dict):
         dataset_cfg = dict(dataset_cfg)
 
     # Add chunk_size and split to the specific config for the adapter
-    dataset_cfg['chunk_size'] = chunk_size
-    dataset_cfg['split'] = split
+    if dataset_cfg:
+        dataset_cfg['chunk_size'] = chunk_size
 
-    # Check if adapter exists
+    # Attempt to get the adapter function for this dataset
     if dataset_name not in DATASET_ADAPTERS:
-        raise ValueError(f"Unknown dataset or adapter not found: {dataset_name}")
-
-    adapter_func = DATASET_ADAPTERS[dataset_name]
-
-    # Call the adapter function with necessary arguments + specific config
+        registered_datasets = list(DATASET_ADAPTERS.keys())
+        raise ValueError(f"Dataset '{dataset_name}' not recognized. Available datasets: {registered_datasets}")
+    
+    adapter_fn = DATASET_ADAPTERS[dataset_name]
+    
+    # Apply any dataset-specific configurations
+    adapter_kwargs = {
+        "tokenizer": tokenizer,
+        "split": split,
+        "streaming": True,
+        "chunk_size": chunk_size
+    }
+    
+    # Add any dataset-specific configuration from the main config
+    if dataset_cfg:
+        adapter_kwargs.update(dataset_cfg)
+    
+    # Check if we should cache results
+    should_cache = False
+    cache_path = None
+    if config and "validation_cache_path" in config:
+        cache_path = config["validation_cache_path"]
+        # Only cache if path exists but no .pkl files yet
+        if cache_path and os.path.isdir(cache_path):
+            pkl_files = [f for f in os.listdir(cache_path) if f.endswith('.pkl')]
+            should_cache = len(pkl_files) == 0
+    
     try:
-        # Pass tokenizer and specific config kwargs to the adapter
-        # The adapter itself will handle streaming=True if needed
-        logger.debug(f"Calling adapter {adapter_func.__name__} with config: {dataset_cfg}")
-        return adapter_func(tokenizer=tokenizer, **dataset_cfg)
+        # Call the adapter function to get the dataset iterator
+        iterator = adapter_fn(**adapter_kwargs)
+        
+        # If caching is enabled, collect and cache samples
+        if should_cache and cache_path:
+            logger.info(f"Will cache processed examples to: {cache_path}")
+            cached_samples = []
+            max_cache_samples = 1000  # Limit cache size for evaluation
+            
+            # Return a wrapped iterator that caches samples as they're processed
+            def caching_iterator():
+                try:
+                    sample_count = 0
+                    for sample in iterator:
+                        # Add to cache list if we haven't hit the limit
+                        if sample_count < max_cache_samples:
+                            cached_samples.append(sample)
+                            sample_count += 1
+                            
+                            # Save cache when we hit the sample limit
+                            if sample_count == max_cache_samples:
+                                _save_to_cache(cache_path, cached_samples, max_cache_samples)
+                        
+                        # Yield the sample to the caller
+                        yield sample
+                        
+                    # Save any remaining samples at the end
+                    if cached_samples and sample_count < max_cache_samples:
+                        _save_to_cache(cache_path, cached_samples, max_cache_samples)
+                        
+                except Exception as e:
+                    logger.error(f"Error in caching iterator: {str(e)}")
+                    # Attempt to save any samples we managed to process
+                    if cached_samples:
+                        _save_to_cache(cache_path, cached_samples, max_cache_samples)
+            
+            return caching_iterator()
+        else:
+            return iterator
     except Exception as e:
-        logger.error(f"Adapter function for '{dataset_name}' failed: {e}")
-        raise  # Re-raise the exception after logging
+        logger.error(f"Error loading dataset '{dataset_name}': {str(e)}")
+        return iter([])  # Return empty iterator
 
 # Dataset-specific configurations will come from the config.yaml file
 # This is kept for backward compatibility but will be deprecated
@@ -653,16 +778,39 @@ def mixed_stream(dataset_names: List[str],
     """
     rng = np.random.default_rng(seed)
     
+    # Cache the dataset iterators to avoid reloading from HuggingFace
+    iterator_cache = {}
+    
+    # Function to get or create a dataset iterator
+    def get_or_create_iterator(name):
+        # Check if we already have a cached iterator for this dataset
+        if name in iterator_cache:
+            logger.debug(f"[DEBUG] Using cached iterator instance for {name}")
+            return iterator_cache[name]
+            
+        # Create a new iterator
+        logger.info(f"[DEBUG] Creating new iterator for {name} in mixed_stream")
+        iterator = get_dataset_iterator(name, tokenizer, split, chunk_size, config)
+        logger.info(f"[DEBUG] mixed_stream got iterator type: {type(iterator)} for {name}")
+        iterator_cache[name] = iterator
+        return iterator
+    
     # Initialize iterators for each dataset
     iterators = {}
     dataset_errors = {}
     for name in dataset_names:
-        try:
-            iterators[name] = get_dataset_iterator(name, tokenizer, split, chunk_size, config)
-        except Exception as e:
-            error_msg = str(e)
-            dataset_errors[name] = error_msg
-            logger.warning(f"Failed to initialize iterator for {name}: {error_msg}")
+        # Set validation_cache_path per dataset
+        dataset_cache_path = os.path.join("data", "validation_cache", name, split)
+        config_for_dataset = dict(config) if config else {}
+        config_for_dataset["validation_cache_path"] = dataset_cache_path
+        logger.info(f"[DEBUG] Setting validation_cache_path for {name}: {dataset_cache_path}")
+        def get_iterator_with_cache():
+            return get_dataset_iterator(name, tokenizer, split, chunk_size, config_for_dataset)
+        iterator = get_iterator_with_cache()
+        if iterator is not None:
+            iterators[name] = iterator
+        else:
+            dataset_errors[name] = "Failed to initialize iterator"
     
     # If all adapters failed, create a synthetic fallback dataset
     if not iterators:
@@ -678,22 +826,24 @@ def mixed_stream(dataset_names: List[str],
         
         try:
             # Get next item from the selected dataset
+            # logger.info(f"[DEBUG] mixed_stream yielding from iterator for {dataset_name} (type: {type(iterators[dataset_name])})")
             yield next(iterators[dataset_name])
         except StopIteration:
             # Reinitialize the iterator if it's exhausted
-            logger.debug(f"Reinitializing iterator for {dataset_name}")
-            try:
-                iterators[dataset_name] = get_dataset_iterator(dataset_name, tokenizer, split, chunk_size, config)
-                yield next(iterators[dataset_name])
-            except Exception as e:
-                error_msg = str(e)
-                logger.error(f"Failed to reinitialize iterator for {dataset_name}: {error_msg}")
-                # Remove this dataset from the mix if we can't reinitialize
+            logger.info(f"[DEBUG] mixed_stream exhausted iterator for {dataset_name}, reinitializing...")
+            # Try to get a cached iterator first
+            iterator = get_or_create_iterator(dataset_name)
+            logger.info(f"[DEBUG] mixed_stream after reinit, got iterator type: {type(iterator)} for {dataset_name}")
+            if iterator is not None:
+                iterators[dataset_name] = iterator
+            else:
+                logger.error(f"[DEBUG] Failed to reinitialize iterator for {dataset_name}")
+                # Remove this dataset from the mix if we can't reinitialize it
                 del iterators[dataset_name]
                 
-                # If all iterators have failed, create a synthetic fallback
+                # If no datasets left, fall back to synthetic data
                 if not iterators:
-                    logger.error("All dataset iterators failed, falling back to synthetic dataset")
+                    logger.error("[DEBUG] All dataset iterators failed, falling back to synthetic dataset")
                     iterators["synthetic_fallback"] = _create_synthetic_fallback(tokenizer, seed, chunk_size)
 
 # ================= Synthetic Fallback Dataset =================
@@ -858,14 +1008,14 @@ class CurriculumDataLoader:
         
         logger.debug(f"Curriculum initialized with dataset: {self.active_datasets[0]}")
     
-    def _create_iterator(self):
+    def _create_iterator(self, seed=None):
         """Create a mixed stream iterator with current active datasets."""
         return mixed_stream(
             dataset_names=self.active_datasets,
             tokenizer=self.tokenizer,
             split=self.split,
             chunk_size=self.chunk_size,
-            seed=self.seed,
+            seed=seed if seed is not None else self.seed,
             config=self.config
         )
     
@@ -920,7 +1070,7 @@ class CurriculumDataLoader:
         return updated
     
     def get_data_loader(self) -> Callable:
-        """Get a data loader function that returns the current mixed stream iterator."""
-        def data_loader_fn():
-            return self.current_iterator
+        """Get a data loader function that returns a fresh mixed stream iterator (independent per call)."""
+        def data_loader_fn(seed=None):
+            return self._create_iterator(seed=seed)
         return data_loader_fn

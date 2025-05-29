@@ -191,7 +191,9 @@ class ValidationCallback(BaseCallback):
             self.best_mean_reward = mean_reward
             # Create save directory if it doesn't exist
             os.makedirs(self.save_path, exist_ok=True)
-            save_filename = os.path.join(self.save_path, f"{self.name_prefix}.zip")
+
+            # update with dynamic model path saving
+            save_filename = os.path.join(self.save_path, f"{self.name_prefix}_05_08_25.zip")
             self.model.save(save_filename)
             if self.verbose > 0:
                 print(f"Model saved to {save_filename}")

@@ -44,7 +44,7 @@ class EntropyScheduleCallback(BaseCallback):
             self.decay_steps = int(total_timesteps * decay_fraction)
         else:
             # Default fallback
-            self.decay_steps = 50000
+            self.decay_steps = 50_000 # move this to config
         
         if self.verbose > 0:
             print(f"Initializing entropy schedule: {self.start_coef} → {self.end_coef} over {self.decay_steps} steps")

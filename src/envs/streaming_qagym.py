@@ -1,11 +1,11 @@
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
-from typing import Iterable, Dict, Any
+from typing import Iterable, Dict, Any, Callable
 from transformers import AutoTokenizer
 from utils.llm_interface import LLMInterface
-from utils.model_paths import llama_32_3b
-from utils.metrics import compute_exact_match, compute_f1, compute_qa_score
+from utils.model_paths import llama_32_3b, llama_31_8b
+from utils.metrics import compute_exact_match, compute_f1, compute_qa_score, max_over_refs, compute_qa_score_multi
 
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -16,10 +16,10 @@ _MAX_WINDOW = 2048                    # budget B
 _TOKENIZER_NAME = "NousResearch/Meta-Llama-3.1-8B"
 
 # top‑level constants (tune later)
-ALPHA      = 0.05   # token cost
-BETA_KEEP  = 0.005  # keep penalty
-BETA_COMP  = 0.002  # compress penalty
-GAMMA_STEP = 0.001  # per‑step thrift penalty
+ALPHA      = 0.01  # token cost
+BETA_KEEP  = -0.02  # keep penalty (negative because it's a cost)
+GAMMA_STEP = 0.00 # per‑step thrift penalty
+KAPPA      = 0.14  # Hindsight credit fraction
 
 tokenizer = AutoTokenizer.from_pretrained(
     _TOKENIZER_NAME,
@@ -50,22 +50,30 @@ class StreamingQAGym(gym.Env):
                  dataset_name: str = "deepmind/narrativeqa",
                  split: str = "train",
                  max_window: int = _MAX_WINDOW,
-                 data_iter: Iterable[Dict[str, Any]] = None,
+                 alpha: float = ALPHA,
+                 beta_keep: float = BETA_KEEP,
+                 gamma_step: float = GAMMA_STEP, # Add gamma_step parameter
+                 kappa: float = KAPPA,            # Hindsight credit fraction
+                 use_hindsight: bool = True,      # Toggle for hindsight credit
+                 data_loader_fn: Callable[[], Iterable[Dict[str, Any]]] = None,
                  chunk_size: int = _CHUNK_SIZE,
-                 token_reward_max: float = 0.1,      # Maximum per-episode token reward
-                 token_reward_anneal_steps: int = 50000,  # Steps to anneal token rewards to 10%
+                 token_reward_max: float = 0.05,      # Maximum per-episode token reward
+                 token_reward_anneal_steps: int = 25000, # Steps to anneal token reward from max to 10%
                  seed: int | None = None):
         super().__init__()
 
         self.dataset_name = dataset_name
         self.split = split
-        self.ds_iter = data_iter
+        self.data_loader_fn = data_loader_fn
+        # Remove the iterator creation from __init__
+        # Each parallel environment needs its own iterator
+        self.ds_iter = None
         self.max_window = max_window
         self.chunk_size = chunk_size
         
         # Token reward parameters
         self.token_reward_max = token_reward_max
-        self.token_reward_anneal_steps = token_reward_anneal_steps
+        self.token_reward_anneal_steps = 1 # token_reward_anneal_steps
         self.global_step = 0  # Will be updated externally
         
         self.rng = np.random.default_rng(seed)
@@ -73,66 +81,116 @@ class StreamingQAGym(gym.Env):
         # Load LLM interface
         # Use a reasonable buffer for question tokens (typically <50 tokens)
         self.llm = LLMInterface(
-            model_path=llama_32_3b,
+            model_path=llama_31_8b,
             n_ctx=self.max_window + 50,  # Buffer for question tokens
             n_threads=4,
             temperature=0.0
         )
-        self.question_ids = []  # Initialize empty, will be set in reset()
+        self.question_ids = []  
+        self.global_env_step = 0  
 
-        # ------------- observation & action spaces -------------------------
-        # 1‑D array of token ids for **current** chunk
-        self.observation_space = spaces.Box(
-            low=0, high=tokenizer.vocab_size - 1,
-            shape=(chunk_size,), dtype=np.int32
-        )
-        # scalar: 0=DROP, 1=KEEP
+        self.question_max_len = 96
+        self.observation_space = spaces.Dict({
+            "chunk": spaces.Box(low=0, high=tokenizer.vocab_size, shape=(self.chunk_size,), dtype=np.int32),
+            "question": spaces.Box(low=0, high=tokenizer.vocab_size, shape=(self.question_max_len,), dtype=np.int32)
+        })
         self.action_space = spaces.Discrete(2)
 
+        self.gamma_step = gamma_step  
+        self.kappa = kappa # Store kappa
+        self.use_hindsight = use_hindsight # Store the flag
+        self.alpha = 0.028 # 0.04
+        self.beta_keep = -0.028 # beta_keep  
+
+        # Initialize other instance variables that are not reset per episode
+        self.ds_iter = None            # Initialized in reset()
+        self.global_step = 0           # Global step count across all episodes
+        self.global_env_step = 0       # Global environment step count
+        
+        # Call _reset_episode_state to initialize episode-specific state
         self._reset_episode_state()
 
     # ------------------------------------------------------------------------
     def _reset_episode_state(self):
-        """Prepare a fresh doc‑question pair."""
-        self.doc_chunks = None
-        self.stored_tokens = []            # rolling context buffer
-        self.question_ids = None
+        """Reset all episode-specific state variables."""
+        self.chunk_idx = 0          
+        self.keep_count = 0
+        self.drop_count = 0
+        self.total_doc_tokens_seen = 0  # Track total document tokens seen
+        self.stored_tokens = []        # Reset tokens in context window
+        self.doc_chunks = []           # Will be loaded during episode setup
+        self.question_ids = []
         self.gold_answer = None
-        self.gold_answer_token_ids = set()  # Will hold tokenized gold answer for heuristic rewards
-        self.chunk_idx = 0
+        self.gold_answers = None    # Multi-reference version
+        self.gold_answer_token_ids = set()  # for use in gold token reward heuristic
         self.steps_left = None             # filled during reset()
+        self.episode_step_details = [] # For tracking rewards for hindsight credit
 
     # ------------------------------------------------------------------------
     def _sample_episode(self):
-        "Draw one (long_doc, question, answer) triplet from data loader."
+        """Draw one (long_doc, question, answer) triplet from data loader.
+        If the iterator is exhausted, recreate it by calling the loader function with a unique seed."""
+        while True:
+            try:
+                episode = next(self.ds_iter)
+                self.doc_chunks = episode["doc_chunks"]
+                self.question_ids = episode["question_ids"]
+                self.gold_answers = episode["answers"]
+                self.example_meta = episode.get("meta", {})  # Store metadata for logging
+                
+                # Use the first answer as the primary answer for backward compatibility
+                self.gold_answer = self.gold_answers[0] if self.gold_answers else ""
+                
+                # Tokenize primary gold answer for heuristic rewards
+                gold_answer_tokens = tokenizer(self.gold_answer, add_special_tokens=False).input_ids
+                self.gold_answer_token_ids = set(gold_answer_tokens)
+                
+                # Reset episode state counters
+                self.chunk_idx = 0
+                
+                # Set the number of steps for this episode
+                self.steps_left = len(self.doc_chunks) + 1   # +1 for final Q&A step
+                return self._get_obs()
+            except StopIteration:
+                # Re-initialize the iterator if exhausted
+                # Use a unique seed for each env reset for independent shuffling
+                unique_seed = self.rng.integers(0, 2**32 - 1)
+                self.ds_iter = iter(self.data_loader_fn(seed=unique_seed))
+        self.gold_answer = self.gold_answers[0] if self.gold_answers else ""
         
-        # Get the next tuple of (doc_chunks, question_ids, gold_answer)
-        try:
-            doc_chunks, question_ids, gold_answer = next(self.ds_iter)  # throws StopIteration when exhausted
-            
-            # Store the values directly from the tuple - they're already tokenized and chunked
-            self.doc_chunks = doc_chunks
-            self.question_ids = question_ids
-            self.gold_answer = gold_answer
-            
-            # Tokenize gold answer for heuristic rewards
-            gold_answer_tokens = tokenizer(self.gold_answer, add_special_tokens=False).input_ids
-            self.gold_answer_token_ids = set(gold_answer_tokens)
-            
-            self.chunk_idx = 0
-            
-            # Set the number of steps for this episode
-            self.steps_left = len(self.doc_chunks) + 1   # +1 for final Q&A step
-            
-        except Exception as e:
-            print(f"Error loading next episode: {e}")
-            raise
+        # Tokenize primary gold answer for heuristic rewards
+        gold_answer_tokens = tokenizer(self.gold_answer, add_special_tokens=False).input_ids
+        self.gold_answer_token_ids = set(gold_answer_tokens)
+        
+        # Reset episode state counters
+        self.chunk_idx = 0
+        
+        # Set the number of steps for this episode
+        self.steps_left = len(self.doc_chunks) + 1   # +1 for final Q&A step
+
+    def _get_obs(self):
+        """Return the current observation as a dict: {chunk, question}."""
+        if hasattr(self, 'doc_chunks') and self.doc_chunks and hasattr(self, 'chunk_idx') and len(self.doc_chunks) > self.chunk_idx:
+            chunk_obs = self._pad(self.doc_chunks[self.chunk_idx], self.chunk_size)
+        else:
+            chunk_obs = self._pad([], self.chunk_size)
+        if hasattr(self, 'question_ids') and self.question_ids:
+            question_obs = self._pad(self.question_ids, self.question_max_len)
+        else:
+            question_obs = self._pad([], self.question_max_len)
+        import numpy as np
+        return {
+            "chunk": np.array(chunk_obs, dtype=np.int32),
+            "question": np.array(question_obs, dtype=np.int32)
+        }
 
     # ================= gym API ==============================================
     def reset(self, *, seed=None, options=None):
         self._reset_episode_state()
+        if self.ds_iter is None:
+            self.ds_iter = iter(self.data_loader_fn())
         self._sample_episode()
-        obs = self._pad(self.doc_chunks[0], self.chunk_size)
+        obs = self._get_obs()
         info = {"step_idx": 0}
         return obs, info
 
@@ -193,75 +251,148 @@ class StreamingQAGym(gym.Env):
             truncated : bool (always False)
             info      : dict
         """
+        # Increment global step count for annealing
+        self.global_step += 1
+        # Increment global environment step count (never resets)
+        self.global_env_step += 1
+        
+        # current_step_reward will be calculated and stored later
+        
         # ------------------------
         # 1) Did we already finish streaming?
         # ------------------------
         if self.chunk_idx >= len(self.doc_chunks):
             # -- question arrival (show question but don't terminate) --
             if self.chunk_idx == len(self.doc_chunks):
-                obs  = self._pad(self.question_ids, self.chunk_size)
+                blank_obs = {
+                    "chunk": np.full(self.chunk_size, tokenizer.pad_token_id, dtype=np.int32),
+                    "question": np.array(self._pad(self.question_ids, self.question_max_len), dtype=np.int32)
+                }
                 info = {"step_idx": self.chunk_idx, "question": True}
                 self.chunk_idx += 1
-                return obs, 0.0, False, False, info
+                # This step is for presenting the question, not a direct action with cost/reward yet.
+                # Store a neutral detail, actual reward comes with QA.
+                self.episode_step_details.append({"reward": 0.0, "is_kept_chunk": False, "is_qa_step": False, "action_taken": -1})
+                return blank_obs, 0.0, False, False, info
+            else:
+                # -- answer phase (final reward + terminate) --
+                # Build prompt from kept tokens + question
+                context    = self.stored_tokens[-self.max_window:]
+                prompt_ids = context + self.question_ids
+                # Query LLM and score
+                model_answer = self._query_llm(prompt_ids)
+                # Print Q&A every 20 global environment steps
+                if self.global_env_step % 25 == 0:
+                    question_text = tokenizer.decode(self.question_ids, skip_special_tokens=True)
+                    print("\n[StreamingQAGym] Global Step {}".format(self.global_env_step))
+                    print("Question:   ", question_text)
+                    print("LLM Answer: ", model_answer)
+                    print("Gold Ans:   ", self.gold_answers if hasattr(self, 'gold_answers') else self.gold_answer)
+                    print("="*60)
+                # Calculate standard metrics against primary answer
+                em = compute_exact_match(model_answer, self.gold_answer)
+                f1 = compute_f1(model_answer, self.gold_answer)
+                # Calculate max-over-references metrics
+                max_em = max_over_refs(compute_exact_match, model_answer, self.gold_answers)
+                max_f1 = max_over_refs(compute_f1, model_answer, self.gold_answers)
+                
+                # Use multi-reference QA score for reward
+                qa_score = compute_qa_score_multi(self.gold_answers, model_answer)
+                token_penalty = self.alpha * (len(prompt_ids) / self.max_window)
+                final_qa_step_reward = qa_score - token_penalty # Reward for this specific step
 
-            # -- answer phase (final reward + terminate) --
-            # Build prompt from kept tokens + question
-            context    = self.stored_tokens[-self.max_window:]
-            prompt_ids = context + self.question_ids
+                # Store details for this final QA step, this step also has a per-step cost
+                self.episode_step_details.append({"reward": final_qa_step_reward + self.gamma_step, "is_kept_chunk": False, "is_qa_step": True, "action_taken": -1}) 
 
-            # Query LLM and score
-            model_answer  = self._query_llm(prompt_ids)
-            em      = compute_exact_match(model_answer, self.gold_answer)
-            f1      = compute_f1(model_answer, self.gold_answer)
-            qa_score      = compute_qa_score(model_answer, self.gold_answer)
-            token_penalty = ALPHA * (len(prompt_ids) / self.max_window)
-            reward        = qa_score - token_penalty
-
-            # Return an “empty” obs and terminate
-            obs = np.full(self.chunk_size, tokenizer.pad_token_id, dtype=np.int32)
-            info = {
-                "step_idx":     self.chunk_idx,
-                "exact_match":  em,
-                "f1":           f1,
-                "qa_score":     qa_score,
-                "tokens_used":  len(prompt_ids),
-                "model_answer": model_answer,
-                "gold_answer":  self.gold_answer,
-            }
-            return obs, reward, True, False, info
-
+                # Hindsight Credit Distribution
+                # Start with the originally calculated rewards for each step
+                hindsight_adjusted_rewards = [step_info["reward"] for step_info in self.episode_step_details]
+                
+                # Initialize hindsight bonus variable with default value
+                hindsight_bonus_per_kept_chunk = 0.0
+                
+                if self.use_hindsight and self.keep_count > 0 and self.kappa > 0:
+                    # Use the raw qa_score (before token penalty) for the hindsight bonus calculation
+                    hindsight_bonus_per_kept_chunk = (self.kappa * qa_score) / self.keep_count
+                    for i, step_detail in enumerate(self.episode_step_details):
+                        # Add bonus only to steps where a chunk was successfully kept
+                        if step_detail["is_kept_chunk"]:
+                            hindsight_adjusted_rewards[i] += hindsight_bonus_per_kept_chunk
+                
+                # Return an "empty" obs and terminate
+                blank_obs = {
+                    "chunk": np.full(self.chunk_size, tokenizer.pad_token_id, dtype=np.int32),
+                    "question": np.full(self.question_max_len, tokenizer.pad_token_id, dtype=np.int32)
+                }
+                info = {
+                    "step_idx":     self.chunk_idx,
+                    "exact_match":  em,  # Single reference (backward compatibility)
+                    "f1":           f1,   # Single reference (backward compatibility)
+                    "max_em":       max_em, # Max over all references
+                    "max_f1":       max_f1, # Max over all references
+                    "qa_score":     qa_score,
+                    "tokens_used":  len(prompt_ids),
+                    "model_answer": model_answer,
+                    "gold_answer":  self.gold_answer,
+                    "gold_answers": self.gold_answers,
+                    "keep_count":   self.keep_count, # Log keep count
+                    "drop_count":   self.drop_count, # Log drop count,
+                    "question_token_ids": self.question_ids,
+                    "doc_tokens_in_final_prompt": len(context), # CHANGED from doc_tokens_in_context: len(self.stored_tokens)
+                    "total_doc_tokens_seen": self.total_doc_tokens_seen # ADDED: Total doc tokens seen
+                }
+                if self.use_hindsight:
+                    info["hindsight_adjusted_rewards"] = hindsight_adjusted_rewards
+                    info["hindsight_bonus_pkc"] = hindsight_bonus_per_kept_chunk
+                else:
+                    info["hindsight_adjusted_rewards"] = [r["reward"] for r in self.episode_step_details] # Original rewards
+                    info["hindsight_bonus_pkc"] = 0.0 # No bonus applied
+                # The reward returned by step() for the final step is its own calculated reward
+                return blank_obs, final_qa_step_reward + self.gamma_step, True, False, info
         # ------------------------
-        # 2) Still in streaming phase: apply action cost + extend tokens
+        # 2) Still in streaming phase: process action, update state
         # ------------------------
+        current_step_reward = self.gamma_step # Apply base per-step penalty
+        token_heuristic_reward = 0.0 
+        current_chunk = self.doc_chunks[self.chunk_idx]
+        chunk_was_actually_kept = False # Flag to indicate if the chunk was stored
+        
+        # Track total document tokens seen
+        self.total_doc_tokens_seen += len(current_chunk)
+
         if action == 1:  # KEEP
-            current_chunk = self.doc_chunks[self.chunk_idx]
-            self.stored_tokens.extend(current_chunk)
+            current_step_reward += self.beta_keep # Cost for *attempting* to keep
             
-            # Apply base cost for keeping
-            reward = - (GAMMA_STEP + BETA_KEEP)
+            # Check window constraint BEFORE adding
+            if len(self.stored_tokens) + len(current_chunk) <= self.max_window:
+                self.stored_tokens.extend(current_chunk)
+                chunk_was_actually_kept = True # Chunk successfully stored
+            # else: chunk is not stored due to overflow, effectively a drop but beta_keep was applied
+
+            # Always truncate to max_window if somehow exceeded (e.g. if logic changes)
+            if len(self.stored_tokens) > self.max_window:
+                self.stored_tokens = self.stored_tokens[-self.max_window:]
             
-            # Add dynamic heuristic reward if gold answer tokens present in this chunk
-            if self.gold_answer_token_ids:
-                # Check for overlap between current chunk and gold answer tokens
+            self.keep_count += 1 # Increment keep_count for the *action* of keeping
+            
+            # Calculate heuristic reward (if applicable and chunk was actually kept)
+            if chunk_was_actually_kept and self.gold_answer_token_ids:
                 overlap = set(current_chunk) & self.gold_answer_token_ids
                 if overlap:
-                    # Dynamic scaling based on answer length and training progress
-                    token_hit = len(overlap)  # Count number of matching tokens
-                    
-                    # Scale per-token reward (max total = token_reward_max)
-                    if len(self.gold_answer_token_ids) > 0:  # Avoid division by zero
+                    token_hit = len(overlap)
+                    if len(self.gold_answer_token_ids) > 0:
                         per_token = self.token_reward_max / len(self.gold_answer_token_ids)
                     else:
-                        per_token = 0.01  # Fallback if no gold tokens
-                    
-                    # Anneal rewards over time (start strong, fade to 10%)
-                    anneal = max(0.1, 1.0 - self.global_step / self.token_reward_anneal_steps) 
-                    
-                    # Apply the scaled and annealed reward
-                    token_reward = token_hit * per_token * anneal
-                    reward += token_reward
-        else:            # DROP (or future COMPRESS)
-            reward = 0.0
+                        per_token = 0.01 # Fallback
+                    anneal_factor = max(0.1, 1.0 - self.global_step / self.token_reward_anneal_steps) 
+                    token_heuristic_reward = token_hit * per_token * anneal_factor
+            current_step_reward += token_heuristic_reward
+        else:  # DROP
+            self.drop_count += 1
+            # No beta_keep cost for drop, only gamma_step (already added)
+
+        # ------------------------
+        self.episode_step_details.append({"reward": current_step_reward, "is_kept_chunk": chunk_was_actually_kept, "is_qa_step": False, "action_taken": action})
 
         # ------------------------
         # 3) Advance to next chunk index
@@ -273,15 +404,25 @@ class StreamingQAGym(gym.Env):
         # ------------------------
         # 4a) Still more chunks?
         if self.chunk_idx < len(self.doc_chunks):
-            obs  = self._pad(self.doc_chunks[self.chunk_idx], self.chunk_size)
-            info = {"step_idx": self.chunk_idx}
-            return obs, reward, False, False, info
+            obs_dict = {
+                "chunk": np.array(self._pad(self.doc_chunks[self.chunk_idx], self.chunk_size), dtype=np.int32),
+                "question": np.array(self._pad(self.question_ids, self.question_max_len), dtype=np.int32)
+            }
+            info = {
+                "step_idx": self.chunk_idx,
+                "token_ids": current_chunk
+            }
+            return obs_dict, current_step_reward, False, False, info
 
         # 4b) Exactly at question
-        if self.chunk_idx == len(self.doc_chunks):
-            obs  = self._pad(self.question_ids, self.chunk_size)
+        elif self.chunk_idx == len(self.doc_chunks):
+            blank_obs = {
+                "chunk": np.full(self.chunk_size, tokenizer.pad_token_id, dtype=np.int32),
+                "question": np.array(self._pad(self.question_ids, self.question_max_len), dtype=np.int32)
+            }
             info = {"step_idx": self.chunk_idx, "question": True}
-            return obs, reward, False, False, info
+            return blank_obs, current_step_reward, False, False, info
+
 
     # ------------------------------------------------------------------------
     def _query_llm(self, prompt_ids):
@@ -297,14 +438,21 @@ class StreamingQAGym(gym.Env):
         # Convert token IDs to text
         prompt_text = tokenizer.decode(prompt_ids, skip_special_tokens=True)
         
-        # Extract the question from the prompt (assuming it's at the end)
+        # Extract the question from the prompt using slicing by length
         question_text = tokenizer.decode(self.question_ids, skip_special_tokens=True)
         
         # Create a system prompt
         system_prompt = "You are a helpful, accurate, and concise assistant. Answer questions based on the provided document."
         
-        # Format the prompt for our improved LLMInterface
-        context_text = prompt_text.replace(question_text, "")
+        # Use slicing to safely separate context from question
+        # First check if prompt_text is at least as long as question_text
+        if len(prompt_text) >= len(question_text):
+            # Extract just the context portion by slicing off the question length from the end
+            context_text = prompt_text[:-len(question_text)].strip()
+        else:
+            # Safety fallback (should not happen in normal operation)
+            context_text = prompt_text
+            
         user_message = f"Document: {context_text}\n\nQuestion: {question_text}\n\nProvide a direct and concise answer."
         
         # Generate the answer using our improved interface
@@ -324,4 +472,120 @@ class StreamingQAGym(gym.Env):
     def set_global_step(self, step: int):
         """Set the global training step for reward annealing."""
         self.global_step = step
-
+        
+    def render(self, mode='human'):
+        """Render the environment's current state.
+        
+        Shows the question, document chunks that were kept vs. dropped,
+        and metrics for qualitative analysis and publication figures.
+        
+        Args:
+            mode: Rendering mode. Only 'human' is supported currently.
+        
+        Returns:
+            None
+        """
+        if mode != 'human':
+            raise NotImplementedError(f"Render mode {mode} not supported")
+        
+        # Print header
+        print("\n" + "="*80)
+        print(f"STREAMING QA ENVIRONMENT STATE")
+        print("="*80)
+        
+        # Print question, LLM answer, and gold answer if available
+        if self.question_ids:
+            question_text = tokenizer.decode(self.question_ids, skip_special_tokens=True)
+            print(f"\nQUESTION: {question_text}")
+        if self.gold_answer:
+            print(f"GOLD ANSWER: {self.gold_answer}")
+        else:
+            print(f"GOLD ANSWER: [Not available]")
+            
+        # Track which chunks have been kept
+        kept_chunks = []
+        dropped_chunks = []
+        
+        # Ensure we only count actual document chunks, not the question
+        doc_chunks_seen = min(self.chunk_idx, len(self.doc_chunks))
+        
+        # Store decisions for visualization
+        chunk_decisions = []
+        
+        # Get data on explicit decisions made so far
+        for i in range(doc_chunks_seen):
+            chunk = self.doc_chunks[i]
+            chunk_text = tokenizer.decode(chunk, skip_special_tokens=True)
+            
+            # Better detection of kept chunks - check first few tokens to reduce false positives
+            # but also not be too strict given potential token splitting differences
+            sample_tokens = set(chunk[:min(10, len(chunk))])  # Take first 10 tokens or fewer
+            is_kept = bool(sample_tokens.intersection(set(self.stored_tokens)))
+            
+            if is_kept:
+                kept_chunks.append((i, chunk_text, len(chunk)))
+            else:
+                dropped_chunks.append((i, chunk_text, len(chunk)))
+        
+        # Print kept chunks
+        print("\nKEPT CHUNKS:")
+        print("-" * 80)
+        if kept_chunks:
+            for idx, text, length in kept_chunks:
+                first_line = text # text[:60] + "..." if len(text) > 60 else text
+                print(f"[{idx}] KEEP - {first_line} ({length} tokens)")
+        else:
+            print("[No chunks kept yet]")
+        print("-" * 80)
+        
+        # Print dropped chunks
+        print("\nDROPPED CHUNKS:")
+        print("-" * 80)
+        if dropped_chunks:
+            for idx, text, length in dropped_chunks:
+                first_line = text # text[:60] + "..." if len(text) > 60 else text
+                print(f"[{idx}] DROP - {first_line} ({length} tokens)")
+        else:
+            print("[No chunks dropped yet]")
+        print("-" * 80)
+        
+        # Print unseen chunks
+        print("\nUNSEEN CHUNKS:")
+        print("-" * 80)
+        future_chunks = len(self.doc_chunks) - self.chunk_idx
+        if future_chunks > 0:
+            print(f"[{future_chunks} chunks not yet processed]")
+        else:
+            print("[All chunks processed]")
+        print("-" * 80)
+        
+        # Print metrics
+        print("\nMETRICS:")
+        print(f"Document chunks: {len(self.doc_chunks)}")
+        
+        # Separately track document chunks vs. question
+        if self.chunk_idx <= len(self.doc_chunks):
+            print(f"Doc chunks seen: {doc_chunks_seen} / {len(self.doc_chunks)}")
+        else:
+            # We've reached the question
+            print(f"Doc chunks seen: {len(self.doc_chunks)} / {len(self.doc_chunks)} (Complete)")
+            print(f"Question seen: Yes")
+        
+        print(f"Chunks kept: {len(kept_chunks)}")
+        print(f"Chunks dropped: {len(dropped_chunks)}")
+        if doc_chunks_seen > 0 and (len(kept_chunks) + len(dropped_chunks)) > 0:
+            keep_ratio = len(kept_chunks)/(len(kept_chunks) + len(dropped_chunks))
+            print(f"Keep ratio: {keep_ratio:.2f}")
+        else:
+            print("Keep ratio: N/A")
+        print(f"Tokens stored: {len(self.stored_tokens)} / {self.max_window} (max window)")
+        
+        # Calculate compression as stored tokens / theoretical max tokens
+        # This shows efficiency vs. the full potential token capacity
+        if len(self.doc_chunks) > 0:
+            # Using the formula: tokens_stored / (len(doc_chunks) * chunk_size)
+            theoretical_max = len(self.doc_chunks) * self.chunk_size
+            compression_ratio = len(self.stored_tokens) / theoretical_max
+            print(f"Compression ratio: {compression_ratio:.4f} ({len(self.stored_tokens)}/{theoretical_max})")
+        
+        print("="*80)

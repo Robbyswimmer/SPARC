@@ -5,6 +5,7 @@ from transformers import AutoTokenizer
 import json
 import re
 import sys
+import contextlib
 
 # Import model paths - use relative import to avoid path issues
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -48,13 +49,38 @@ class LLMInterface:
         self.temperature = temperature
         self.verbose = verbose
         
-        # Initialize the model
-        self.model = Llama(
-            model_path=model_path,
-            n_ctx=n_ctx,
-            n_threads=n_threads,
-            seed=42,
-        )
+        # Initialize the model with suppressed stderr output
+        # This prevents the ggml_metal_init messages from being printed
+        if not self.verbose:
+            # Create a context manager to redirect stderr
+            @contextlib.contextmanager
+            def suppress_stderr():
+                original_stderr = sys.stderr
+                try:
+                    with open(os.devnull, 'w') as devnull:
+                        sys.stderr = devnull
+                        yield
+                finally:
+                    sys.stderr = original_stderr
+            
+            # Initialize model with suppressed stderr
+            with suppress_stderr():
+                self.model = Llama(
+                    model_path=model_path,
+                    n_ctx=n_ctx,
+                    n_threads=n_threads,
+                    seed=42,
+                    verbose=False,
+                )
+        else:
+            # Initialize model normally if verbose is True
+            self.model = Llama(
+                model_path=model_path,
+                n_ctx=n_ctx,
+                n_threads=n_threads,
+                seed=42,
+                verbose=False,
+            )
         
         # Use tokenizer's special tokens
         self.bos_token = tokenizer.bos_token if hasattr(tokenizer, 'bos_token') else '<s>'

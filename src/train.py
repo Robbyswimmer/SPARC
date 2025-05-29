@@ -1,25 +1,28 @@
 # src/train.py
-import hydra, wandb, torch, gymnasium as gym
-from omegaconf import DictConfig, OmegaConf
+import hydra, wandb
+from omegaconf import DictConfig
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor
 from stable_baselines3.common.callbacks import BaseCallback
 from transformers import AutoTokenizer
-import itertools
-from typing import Optional
 
 from envs.streaming_qagym import StreamingQAGym
-from agents.ppo_agent import TokenEmbedExtractor, WandbCallback
+from agents.ppo_agent import TokenEmbedExtractor, WandbCallback, HindsightRewardCallback
 from agents.entropy_schedule import EntropyScheduleCallback
 from agents.global_step_callback import GlobalStepCallback
-from data.narrativeqa import load_narrativeqa
-from data.hotpotqa    import load_hotpotqa
+from agents.eval_callback import ValidationCallback
+from agents.curriculum_callback import CurriculumCallback
+from data.data_registry import CurriculumDataLoader, mixed_stream, get_dataset_iterator
 from curricula.length_schedule import LengthScheduleWrapper
 
+import logging
+import os
+logger = logging.getLogger(__name__)
 
-class CurriculumStepCallback(BaseCallback):
+
+class ChunkCurriculumCallback(BaseCallback):
     """
-    Callback that advances curriculum step counter based on actual training steps.
+    Callback that advances chunk length curriculum counter based on actual training steps.
     
     This ensures the curriculum progresses properly in RL training, where the environment
     is only reset at episode completion rather than every training step.
@@ -41,14 +44,46 @@ class CurriculumStepCallback(BaseCallback):
             # Log current curriculum level occasionally
             if self.n_calls % 1000 == 0:  # Report less frequently
                 current_max = self.curriculum_wrapper.get_current_max_chunks()
-                print(f"Step {self.n_calls}: Curriculum max chunks = {current_max}")
+                logger.info(f"Step {self.n_calls}: Chunk curriculum max chunks = {current_max}")
+                # Log to wandb if available
+                try:
+                    if wandb.run is not None:
+                        wandb.log({
+                            "curriculum/max_chunks": current_max,
+                            "global_step": self.num_timesteps
+                        })
+                except:
+                    pass  # Ignore wandb errors
         return True
 
-DATASETS = {
-    "narrativeqa": load_narrativeqa,
-    "hotpotqa"   : load_hotpotqa,
-    # add more loaders here
-}
+# Custom callback to periodically render environment
+class RenderCallback(BaseCallback):
+    """Callback for rendering environment periodically during training."""
+    
+    def __init__(self, render_freq=100, verbose=0):
+        super().__init__(verbose)
+        self.render_freq = render_freq
+        self.last_timesteps = 0
+    
+    def _on_step(self) -> bool:
+        # Get current global step number
+        current_timesteps = self.model.num_timesteps
+        
+        # Check if we've passed a multiple of render_freq since last render
+        steps_since_last = current_timesteps - self.last_timesteps
+        
+        # Only render if we've added at least render_freq more steps
+        if steps_since_last >= self.render_freq:
+            print(f"\n\n[RenderCallback] Rendering at step {current_timesteps}")
+            try:
+                # Render the first environment
+                self.training_env.env_method("render", indices=[0])
+                # Update last render timestep
+                self.last_timesteps = current_timesteps
+                print("[RenderCallback] Render completed successfully")
+            except Exception as e:
+                print(f"[RenderCallback] Error rendering: {e}")
+        return True
 
 @hydra.main(version_base=None, config_path="../conf", config_name="config")
 def main(cfg: DictConfig):
@@ -60,31 +95,164 @@ def main(cfg: DictConfig):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         print(f"Set pad_token to eos_token: {tokenizer.pad_token}")
-
-    # 1) Build joint iterable over chosen datasets
-    loaders = [DATASETS[name](tokenizer=tokenizer,split=cfg.data.split) for name in cfg.data.datasets]
-    mixed_loader = itertools.cycle(itertools.chain(*loaders))  # simple round‑robin
-
-    # 2) Create curriculum wrapper if requested
-    curriculum_wrapper = None
-    if cfg.curriculum.enabled:
-        curriculum_wrapper = LengthScheduleWrapper(
-            mixed_loader,
-            initial_max_chunks=cfg.curriculum.start_chunks,
-            final_max_chunks=cfg.curriculum.max_chunks, 
-            total_schedule_steps=cfg.curriculum.growth_steps,
+    
+    # Initialize dataset curriculum settings
+    dataset_enabled = cfg.data.get('curriculum_enabled', False)
+    dataset_order = cfg.data.get('dataset_order', cfg.data.datasets)
+    qa_thresholds = cfg.data.get('qa_thresholds', [0.3, 0.4, 0.5])
+    
+    # Setup either curriculum-based or standard dataset loading
+    if dataset_enabled:
+        logger.info(f"Initializing dataset curriculum with order: {dataset_order}")
+        logger.info(f"QA thresholds for progression: {qa_thresholds}")
+        
+        # Create curriculum data loader with progressive dataset mixing
+        curriculum_loader = CurriculumDataLoader(
+            tokenizer=tokenizer,
+            dataset_order=dataset_order,
+            qa_thresholds=qa_thresholds,
+            split="train",
+            seed=cfg.train.seed,
+            chunk_size=cfg.env.chunk_size,
+            config=cfg  # Pass the full config object
         )
-        mixed_loader = curriculum_wrapper
+        
+        # Get the iterator directly - not a function that returns an iterator
+        # We'll wrap this in a lambda below to match expected interface
+        train_iterator = curriculum_loader.current_iterator
+    else:
+        # Use standard mixed stream without curriculum
+        logger.info(f"Using fixed mixed dataset stream with: {cfg.data.datasets}")
+        
+        # Create a mixed stream of all datasets
+        def train_loader_fn():
+            return mixed_stream(
+                dataset_names=cfg.data.datasets,
+                tokenizer=tokenizer,
+                split=cfg.data.split,
+                chunk_size=cfg.env.chunk_size,
+                seed=cfg.train.seed,
+                config=cfg
+            )
+    
+    # This will be called each time validation runs to get fresh data
+    def get_validation_data(seed=None):
+        """Loads validation data directly from the pre-processed cache directory.
+        Accepts an optional seed argument for compatibility; it is ignored."""
+        validation_cache_path = os.path.join(hydra.utils.get_original_cwd(), cfg.data.validation_cache_dir)
+        logger.info(f"Creating validation data iterator from cache: {validation_cache_path}")
+
+        try:
+            # Use the updated get_dataset_iterator, passing the directory path
+            # The tokenizer is technically not needed when loading from cache,
+            # but the function signature requires it.
+            validation_iterator = get_dataset_iterator(
+                dataset_name=validation_cache_path,
+                tokenizer=tokenizer, # Still needed for function signature
+                split="validation", # Not used for cache loading, but provide for consistency
+                chunk_size=cfg.env.chunk_size, # Not used for cache loading
+                config=cfg # Pass config in case it's needed by registry internals
+            )
+
+            # Basic check to ensure the iterator yields something
+            first_item = next(validation_iterator)
+            # We need to reconstruct the iterator after checking the first item
+            import itertools
+            validation_iterator = itertools.chain([first_item], validation_iterator)
+
+            logger.info("Successfully obtained validation iterator from cache.")
+            return validation_iterator
+
+        except StopIteration:
+            logger.error(f"Validation cache directory '{validation_cache_path}' exists but contains no valid data (.jsonl files might be empty or missing).")
+            raise ValueError(f"No data found in validation cache: {validation_cache_path}")
+        except Exception as e:
+            logger.error(f"Failed to load validation data from cache '{validation_cache_path}': {e}")
+            # Re-raise the exception as validation data is critical here
+            raise ValueError(f"Critical error loading validation data from cache: {e}")
+
+    # 2) Create chunk length curriculum wrapper if requested
+    chunk_curriculum_wrapper = None
+    state_refs = {
+        'chunk_curriculum_wrapper': None,
+        'train_data_fn': None
+    }
+    if cfg.curriculum.enabled:
+        logger.info(f"Using chunk length curriculum: {cfg.curriculum.start_chunks} → {cfg.curriculum.max_chunks} chunks")
+        
+        # If using dataset curriculum, we need to use the curriculum iterator as the base
+        if dataset_enabled:
+            # Create a wrapper around the curriculum iterator
+            state_refs['chunk_curriculum_wrapper'] = LengthScheduleWrapper(
+                base_iterator=train_iterator,  # Already an iterator, not a function
+                initial_max_chunks=cfg.curriculum.start_chunks,
+                final_max_chunks=cfg.curriculum.max_chunks,
+                total_schedule_steps=cfg.curriculum.growth_steps
+            )
+            
+            # Create a function that returns this wrapper (to match expected interface)
+            # This function doesn't recreate the wrapper each time - it's already wrapped
+            state_refs['train_data_fn'] = lambda: state_refs['chunk_curriculum_wrapper']
+        else:
+            # Standard approach without dataset curriculum - create a mixed stream
+            mixed_iterator = mixed_stream(
+                dataset_names=cfg.data.datasets,
+                tokenizer=tokenizer,
+                split=cfg.data.split,
+                seed=cfg.train.seed
+            )
+            
+            # Wrap the mixed stream in the chunk length curriculum
+            state_refs['chunk_curriculum_wrapper'] = LengthScheduleWrapper(
+                base_iterator=mixed_iterator,
+                initial_max_chunks=cfg.curriculum.start_chunks,
+                final_max_chunks=cfg.curriculum.max_chunks, 
+                total_schedule_steps=cfg.curriculum.growth_steps,
+            )
+            
+            # Create a function that returns the wrapped iterator
+            state_refs['train_data_fn'] = lambda: state_refs['chunk_curriculum_wrapper']
+    else:
+        # No chunk length curriculum
+        if dataset_enabled:
+            # Use the curriculum iterator directly
+            state_refs['train_data_fn'] = lambda: train_iterator
+        else:
+            # Create a standard mixed stream
+            state_refs['train_data_fn'] = lambda: mixed_stream(
+                dataset_names=cfg.data.datasets,
+                tokenizer=tokenizer,
+                split=cfg.data.split,
+                seed=cfg.train.seed
+            )
 
     # 3) Factory to create fresh envs that consume the loader
     def make_env(seed=None):
         def _thunk():
-            return StreamingQAGym(
+            env = StreamingQAGym(
                 chunk_size   = cfg.env.chunk_size,
                 max_window   = cfg.env.max_window,
-                data_iter    = mixed_loader,   # pass iterator
-                seed         = seed,
+                data_loader_fn = state_refs['train_data_fn'],
+                alpha = cfg.env.reward.alpha,
+                beta_keep = cfg.env.reward.beta_keep,
+                gamma_step = cfg.env.reward.gamma_step,
+                kappa = cfg.env.reward.kappa, # Pass hindsight credit fraction
+                use_hindsight = cfg.env.reward.get('use_hindsight', True), # Pass use_hindsight
+                seed = seed,
             )
+            # If using wrapped loader_fn approach for dataset+chunk curriculum, 
+            # store reference to the wrapper for the callback
+            if dataset_enabled and cfg.curriculum.enabled:
+                # Check if the data iterator is already a LengthScheduleWrapper
+                if isinstance(env.ds_iter, LengthScheduleWrapper):
+                    state_refs['chunk_curriculum_wrapper'] = env.ds_iter
+                # Or check if it might be inside the iterator's __self__ attribute
+                elif hasattr(env.ds_iter, '__self__') and hasattr(env.ds_iter.__self__, '__dict__'):
+                    for item in env.ds_iter.__self__.__dict__.values():
+                        if isinstance(item, LengthScheduleWrapper):
+                            state_refs['chunk_curriculum_wrapper'] = item
+                            break
+            return env
         return _thunk
 
     vec_env = DummyVecEnv([make_env(seed=i) for i in range(cfg.train.n_envs)])
@@ -98,7 +266,7 @@ def main(cfg: DictConfig):
     )
 
     model = PPO(
-        "MlpPolicy",
+        "MultiInputPolicy",
         vec_env,
         learning_rate = cfg.train.lr,
         n_steps       = cfg.train.n_steps,
@@ -106,28 +274,111 @@ def main(cfg: DictConfig):
         gamma         = cfg.train.gamma,
         gae_lambda    = cfg.train.gae_lambda,
         clip_range    = cfg.train.clip_range,
-        ent_coef      = 0.05,  # Start with high entropy for exploration
+        ent_coef      = 0.02,  # Start with high entropy for exploration
         policy_kwargs = policy_kwargs,
         tensorboard_log = "./runs/tb",
         device          = "auto",
     )
 
+    # === Checkpoint loading logic ===
+    checkpoint_path = "checkpoints/sparc_best_model_05_08_25.zip"
+    if os.path.exists(checkpoint_path):
+        print(f"Loading checkpoint from {checkpoint_path}")
+        model.set_parameters(checkpoint_path)
+    else:
+        print(f"No checkpoint found at {checkpoint_path}, training from scratch.")
+
     run_name = f"{cfg.exp.name}-{wandb.util.generate_id()}"
     # Setup callbacks
-    callbacks = [WandbCallback(project=cfg.wandb.project, run_name=run_name)]
+    callbacks = [
+        GlobalStepCallback(), 
+        WandbCallback(
+            project=cfg.wandb.project, 
+            run_name=run_name, 
+            config=cfg,
+            log_hindsight_bonus_steps=cfg.wandb.get('log_hindsight_bonus_steps', 2000) # Pass new param
+            ),
+    ]
     
-    # Add curriculum callback if curriculum is enabled
-    if cfg.curriculum.enabled and curriculum_wrapper is not None:
-        curriculum_callback = CurriculumStepCallback(
-            curriculum_wrapper=curriculum_wrapper,
+    # Conditionally add HindsightRewardCallback
+    if cfg.env.reward.get('use_hindsight', True):
+        callbacks.append(HindsightRewardCallback(verbose=1))
+        logger.info("Hindsight Reward Callback ENABLED.")
+    else:
+        logger.info("Hindsight Reward Callback DISABLED.")
+    
+    # Add chunk length curriculum callback if enabled
+    if cfg.curriculum.enabled and state_refs['chunk_curriculum_wrapper'] is not None:
+        chunk_callback = ChunkCurriculumCallback(
+            curriculum_wrapper=state_refs['chunk_curriculum_wrapper'],
             frequency=1  # Advance every step
         )
-        callbacks.append(curriculum_callback)
-        print("Using curriculum progression callback")
+        callbacks.append(chunk_callback)
+        logger.info("Using chunk length curriculum progression callback")
+    
+    # Add validation callback for performance tracking on held-out data
+    # Create this before dataset curriculum callback since it depends on it
+    validation_callback = ValidationCallback(
+        eval_freq=cfg.eval.frequency,      # How often to evaluate
+        eval_episodes=cfg.eval.episodes,   # Number of validation episodes
+        data_loader_fn=get_validation_data,  # Validation data loader function
+        n_eval_envs=1,                     # Single environment for validation
+        save_path=cfg.eval.save_path,      # Path to save best model
+        name_prefix=cfg.eval.name_prefix,  # Prefix for best model file
+        verbose=1
+    )
+    callbacks.append(validation_callback)
+    print("Using validation callback for performance tracking and checkpointing")
+    
+    # Add dataset curriculum callback if enabled
+    if dataset_enabled:
+        
+        # When curriculum loader is updated, we need to:
+        # 1. Update the train_iterator in CurriculumDataLoader
+        # 2. Update the train_data_fn to use the new iterator
+        # 3. Possibly update chunk_curriculum_wrapper if using both curricula
+        
+        # Create a custom update function for the callback
+        def update_dataset_curriculum(qa_score: float) -> bool:
+            # Try to update curriculum
+            updated = curriculum_loader.update_curriculum(qa_score)
+            
+            if updated:
+                # If using chunk curriculum, need to rewrap the new iterator
+                if cfg.curriculum.enabled and state_refs['chunk_curriculum_wrapper'] is not None:
+                    # Create a new chunk curriculum wrapper with the updated iterator
+                    state_refs['chunk_curriculum_wrapper'] = LengthScheduleWrapper(
+                        base_iterator=curriculum_loader.current_iterator,
+                        initial_max_chunks=cfg.curriculum.start_chunks,
+                        final_max_chunks=cfg.curriculum.max_chunks,
+                        total_schedule_steps=cfg.curriculum.growth_steps
+                    )
+                    
+                    # Update the data function to use the new wrapper
+                    state_refs['train_data_fn'] = lambda: state_refs['chunk_curriculum_wrapper']
+                    
+                    logger.info("Updated chunk curriculum wrapper with new dataset mix")
+                else:
+                    # Just update the training data function to use the new iterator
+                    state_refs['train_data_fn'] = lambda: curriculum_loader.current_iterator
+            
+            return updated
+            
+        # Create and add the callback with our custom update function
+        # Note: We pass the validation_callback to use its metrics instead of on-policy rollouts
+        dataset_callback = CurriculumCallback(
+            curriculum_loader=curriculum_loader,
+            validation_callback=validation_callback,  # Use validation metrics for curriculum decisions
+            eval_freq=cfg.eval.frequency,  # Check after each validation run
+            verbose=1,
+            update_fn=update_dataset_curriculum
+        )
+        callbacks.append(dataset_callback)
+        print("Using dataset curriculum progression callback with validation metrics")
     
     # Add entropy schedule callback to linearly decay entropy coefficient
     entropy_callback = EntropyScheduleCallback(
-        start_coef=0.05,
+        start_coef=0.07,
         end_coef=0.0,
         decay_fraction=0.5,  # Decay over first half of training
         total_timesteps=cfg.train.total_steps,

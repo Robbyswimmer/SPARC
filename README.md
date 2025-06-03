@@ -67,16 +67,6 @@ Reward: QA_EM + QA_F1 − token_penalty − step_penalty − compress_penalty
 
 Policy: 3-layer Transformer (<12M params)
 
-📝 Citation
-
-@inprogress{sparc2025,
-  title={SPARC: Streaming Pruning and Retention Controller for Budget-Aware LLM Inference},
-  author={Moseley, Robby},
-  year={2025},
-  journal={arXiv preprint},
-  note={In preparation}
-}
-
 🤝 Contributing
 
 We welcome PRs that improve training stability, extend evaluation tasks, or add summarisation capabilities. Please lint and test your code and follow the contribution guidelines in .windsurfrules.

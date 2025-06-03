@@ -77,10 +77,6 @@ Policy: 3-layer Transformer (<12M params)
   note={In preparation}
 }
 
-📜 License
-
-MIT License. See LICENSE file for details.
-
 🤝 Contributing
 
 We welcome PRs that improve training stability, extend evaluation tasks, or add summarisation capabilities. Please lint and test your code and follow the contribution guidelines in .windsurfrules.
